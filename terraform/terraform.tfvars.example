@@ -1,0 +1,38 @@
+# OpenShift 4.19 UPI Infrastructure Configuration Example
+# Copy this file to terraform.tfvars and customize the values
+
+# Required Variables
+project_id   = "your-gcp-project-id"
+cluster_name = "ocp"
+domain_name  = "ocp.j7ql2.gcp.redhatworkshops.io"
+
+# Optional Variables (with defaults shown)
+region = "us-central1"
+zones  = ["us-central1-a", "us-central1-b", "us-central1-c"]
+
+# Network Configuration
+subnet_cidrs = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]  # One per AZ
+pod_cidrs    = ["10.128.0.0/16", "10.129.0.0/16", "10.130.0.0/16"]  # One per AZ
+service_cidr = "172.30.0.0/16"
+
+# VIP Configuration removed - using direct DNS to worker nodes
+
+# Compute Configuration
+control_plane_machine_type = "e2-standard-4"  # 4 vCPUs, 16GB RAM
+worker_machine_type        = "e2-standard-4"  # 4 vCPUs, 16GB RAM
+control_plane_disk_size    = 120              # GB
+worker_disk_size           = 120              # GB
+
+# OpenShift and RHCOS Configuration
+ocp_version   = "4.19"     # OpenShift version
+rhcos_version = "4.19.10"  # RHCOS version
+
+# Ignition Configurations (set these after generating ignition files)
+# control_plane_ignition_config = file("./master.ign")
+# worker_ignition_config        = file("./worker.ign")
+
+# Firewall Source Ranges
+ssh_source_ranges = ["10.0.0.0/8"]          # Restrict SSH access
+api_source_ranges = ["10.0.0.0/8"]          # Restrict API access
+ingress_source_ranges = ["0.0.0.0/0"]       # Allow public ingress
+nodeport_source_ranges = ["10.0.0.0/8"]     # Restrict NodePort access

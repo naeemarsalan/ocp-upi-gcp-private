@@ -1,0 +1,113 @@
+# ===========================================
+# OpenShift UPI GCP Deployment - .gitignore
+# ===========================================
+
+# Generated Cluster Configuration (contains sensitive data)
+clusterconfig/
+kubeconfig
+
+# SSH Keys (keep directory structure, ignore keys)
+keys/*.pem
+keys/*.key
+keys/id_rsa*
+keys/*.pub
+# Keep keys directory
+!keys/.gitkeep
+
+# Terraform State and Generated Files (in terraform/ subdirectory)
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/*.tfplan
+terraform/terraform.tfstate*
+terraform/terraform.tfvars
+# Keep terraform.tfvars.example as template
+!terraform/terraform.tfvars.example
+
+# Legacy terraform files (if any remain in root)
+.terraform/
+.terraform.lock.hcl
+*.tfplan
+terraform.tfstate*
+
+# OpenShift Configuration (keep templates, ignore actual configs)
+config/install-config.yaml
+# Keep config directory
+!config/.gitkeep
+
+# Downloaded Artifacts and Images  
+artifacts/
+*.tar.gz
+*.img
+*.qcow2
+rhcos-*
+openshift-install-linux*.tar.gz
+oc-*-linux.tar.gz
+
+# Google Cloud Service Account Files
+sa.json
+*-key.json
+service-account-*.json
+google-credentials.json
+
+# Logs and Temporary Files
+.openshift_install.log
+*.log
+.ansible/
+ansible/*.retry
+ansible/.ansible_galaxy/
+
+# Ignition Files (generated, contain sensitive data)
+*.ign
+
+# Certificate Files
+*.crt
+*.csr
+*.cert
+*.pem
+
+# IDE/Editor Files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.envrc
+
+# OS Generated Files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Python (if using Python automation)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Environment Files
+.env
+.env.local
+.env.*.local
+
+# Temporary and Cache Directories
+.cache/
+tmp/
+temp/
+.tmp/
+
+# Backup Files
+*.bak
+*.backup
+
+# Local Development Scripts
+local-*
+test-*
+debug-*
+
+# Container Files
+Dockerfile.local
+docker-compose.override.yml
