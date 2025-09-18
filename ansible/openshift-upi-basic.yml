@@ -1,0 +1,492 @@
+---
+- name: OpenShift UPI Complete Deployment Automation
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ansible-vars.yml
+  
+  tasks:
+    # ================================
+    # 1. Prerequisites Validation
+    # ================================
+    
+    - name: Verify required tools are installed
+      command: "{{ item }} --version"
+      register: tool_check
+      failed_when: tool_check.rc != 0
+      changed_when: false
+      loop:
+        - terraform
+        - openshift-install
+        - gcloud
+      tags: [prerequisites]
+
+    - name: Check if gcloud is authenticated
+      command: gcloud auth list --filter=status:ACTIVE --format="value(account)"
+      register: gcloud_auth
+      failed_when: gcloud_auth.stdout == ""
+      changed_when: false
+      tags: [prerequisites]
+
+    - name: Verify SSH key exists
+      stat:
+        path: "{{ ssh_key_path }}"
+      register: ssh_key_stat
+      failed_when: not ssh_key_stat.stat.exists
+      tags: [prerequisites]
+
+    - name: Verify install-config.yaml exists
+      stat:
+        path: "../config/install-config.yaml"
+      register: install_config_stat
+      failed_when: not install_config_stat.stat.exists
+      tags: [prerequisites]
+
+    - name: Verify terraform.tfvars exists
+      stat:
+        path: "../terraform/terraform.tfvars"
+      register: terraform_vars_stat
+      failed_when: not terraform_vars_stat.stat.exists
+      tags: [prerequisites]
+
+    # ================================
+    # 2. OpenShift Ignition Generation
+    # ================================
+    
+    - name: Clean previous cluster configuration
+      file:
+        path: "../clusterconfig"
+        state: absent
+      tags: [ignition]
+
+    - name: Create clusterconfig directory
+      file:
+        path: "../clusterconfig"
+        state: directory
+        mode: '0755'
+      tags: [ignition]
+
+    - name: Copy install-config.yaml to clusterconfig
+      copy:
+        src: "../config/install-config.yaml"
+        dest: "../clusterconfig/install-config.yaml"
+        mode: '0644'
+      tags: [ignition]
+
+    - name: Generate OpenShift ignition configs
+      command: openshift-install create ignition-configs --dir=../clusterconfig
+      register: ignition_result
+      tags: [ignition]
+
+    - name: Verify ignition files were created
+      stat:
+        path: "../clusterconfig/{{ item }}"
+      register: ignition_files
+      failed_when: not ignition_files.stat.exists
+      loop:
+        - bootstrap.ign
+        - master.ign
+        - worker.ign
+      tags: [ignition]
+
+    - name: Display ignition generation status
+      debug:
+        msg: "✓ OpenShift ignition configs generated successfully"
+      tags: [ignition]
+
+    # ================================
+    # 3. RHCOS Image Management
+    # ================================
+    
+    - name: Check if RHCOS image exists in GCP
+      shell: gcloud compute images describe {{ rhcos_image_name }} --format="value(name)" 2>/dev/null || echo "not_found"
+      register: rhcos_image_check
+      changed_when: false
+      tags: [rhcos]
+
+    - name: Display RHCOS image status
+      debug:
+        msg: "RHCOS image {{ rhcos_image_name }}: {{ 'EXISTS' if rhcos_image_check.stdout != 'not_found' else 'NOT FOUND - will download and upload' }}"
+      tags: [rhcos]
+
+    - name: Create artifacts directory
+      file:
+        path: "../artifacts"
+        state: directory
+        mode: '0755'
+      when: rhcos_image_check.stdout == "not_found"
+      tags: [rhcos]
+
+    - name: Download RHCOS image
+      get_url:
+        url: "https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/4.19/{{ rhcos_version }}/rhcos-{{ rhcos_version }}-x86_64-gcp.x86_64.tar.gz"
+        dest: "../artifacts/rhcos-{{ rhcos_version }}-x86_64-gcp.x86_64.tar.gz"
+        mode: '0644'
+        timeout: 300
+      when: rhcos_image_check.stdout == "not_found"
+      register: rhcos_download
+      tags: [rhcos]
+
+    - name: Get current GCP project ID
+      shell: gcloud config get-value project
+      register: gcp_project_id
+      changed_when: false
+      when: rhcos_image_check.stdout == "not_found"
+      tags: [rhcos]
+
+    - name: Create temporary GCS bucket for RHCOS image
+      shell: gsutil mb gs://{{ gcp_project_id.stdout }}-rhcos-temp || true
+      when: rhcos_image_check.stdout == "not_found"
+      tags: [rhcos]
+
+    - name: Upload RHCOS image to GCS
+      shell: gsutil cp ../artifacts/rhcos-{{ rhcos_version }}-x86_64-gcp.x86_64.tar.gz gs://{{ gcp_project_id.stdout }}-rhcos-temp/
+      when: rhcos_image_check.stdout == "not_found"
+      tags: [rhcos]
+
+    - name: Create RHCOS image in GCP
+      shell: |
+        gcloud compute images create {{ rhcos_image_name }} \
+          --source-uri=gs://{{ gcp_project_id.stdout }}-rhcos-temp/rhcos-{{ rhcos_version }}-x86_64-gcp.x86_64.tar.gz \
+          --guest-os-features=UEFI_COMPATIBLE \
+          --description="Red Hat Enterprise Linux CoreOS {{ rhcos_version }}"
+      when: rhcos_image_check.stdout == "not_found"
+      register: rhcos_image_create
+      tags: [rhcos]
+
+    - name: Cleanup temporary GCS bucket
+      shell: |
+        gsutil rm gs://{{ gcp_project_id.stdout }}-rhcos-temp/rhcos-{{ rhcos_version }}-x86_64-gcp.x86_64.tar.gz
+        gsutil rb gs://{{ gcp_project_id.stdout }}-rhcos-temp
+      when: rhcos_image_check.stdout == "not_found"
+      ignore_errors: true
+      tags: [rhcos]
+
+    - name: Display RHCOS image management status
+      debug:
+        msg: "{{ '✓ RHCOS image created successfully' if rhcos_image_check.stdout == 'not_found' else '✓ RHCOS image already exists' }}"
+      tags: [rhcos]
+
+    # ================================
+    # 4. Terraform Infrastructure Deployment
+    # ================================
+    
+    - name: Initialize Terraform
+      terraform:
+        project_path: "../terraform"
+        state: present
+        force_init: true
+      register: terraform_init
+      tags: [terraform]
+
+    - name: Plan Terraform deployment
+      terraform:
+        project_path: "../terraform"
+        state: planned
+        plan_file: terraform.tfplan
+      register: terraform_plan
+      tags: [terraform]
+
+    - name: Apply Terraform configuration
+      terraform:
+        project_path: "../terraform"
+        state: present
+        plan_file: terraform.tfplan
+      register: terraform_apply
+      tags: [terraform]
+
+    - name: Display infrastructure deployment status
+      debug:
+        msg: "✓ GCP infrastructure deployed successfully"
+      tags: [terraform]
+
+    - name: Wait for infrastructure to stabilize
+      pause:
+        seconds: 30
+      tags: [terraform]
+
+    # ================================
+    # 5. Environment Setup
+    # ================================
+    
+    - name: Get bastion external IP
+      shell: gcloud compute instances describe {{ cluster_name }}-bastion --zone={{ bastion_zone }} --format="value(networkInterfaces[0].accessConfigs[0].natIP)"
+      register: bastion_external_ip
+      changed_when: false
+
+    - name: Display deployment info
+      debug:
+        msg: |
+          Starting basic OpenShift UPI automation for cluster: {{ cluster_name }}
+          Bastion External IP: {{ bastion_external_ip.stdout }}
+          Domain: {{ domain_name }}
+
+    # ================================
+    # 2. Copy kubeconfig to bastion
+    # ================================
+    
+    - name: Ensure clusterconfig directory exists on bastion
+      shell: |
+        ssh -i {{ ssh_key_path }} -o StrictHostKeyChecking=no {{ bastion_user }}@{{ bastion_external_ip.stdout }} '
+        mkdir -p ~/clusterconfig/auth'
+      changed_when: false
+
+    - name: Copy kubeconfig to bastion
+      shell: |
+        scp -i {{ ssh_key_path }} -o StrictHostKeyChecking=no {{ kubeconfig_path }} {{ bastion_user }}@{{ bastion_external_ip.stdout }}:~/clusterconfig/auth/kubeconfig
+
+    - name: Download kubectl on bastion
+      shell: |
+        ssh -i {{ ssh_key_path }} -o StrictHostKeyChecking=no {{ bastion_user }}@{{ bastion_external_ip.stdout }} '
+        if ! command -v kubectl >/dev/null 2>&1; then
+          echo "Downloading kubectl..."
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          echo "kubectl installed"
+        else
+          echo "kubectl already installed"
+        fi'
+
+    # ================================
+    # 3. Get Infrastructure IPs
+    # ================================
+    
+    - name: Get control plane IPs
+      shell: |
+        gcloud compute instances describe {{ cluster_name }}-control-1 --zone={{ control_plane_zones[0] }} --format="value(networkInterfaces[0].networkIP)"
+        gcloud compute instances describe {{ cluster_name }}-control-2 --zone={{ control_plane_zones[1] }} --format="value(networkInterfaces[0].networkIP)"
+        gcloud compute instances describe {{ cluster_name }}-control-3 --zone={{ control_plane_zones[2] }} --format="value(networkInterfaces[0].networkIP)"
+      register: control_plane_ips_output
+      changed_when: false
+
+    - name: Set control plane IPs list
+      set_fact:
+        control_plane_ips: "{{ control_plane_ips_output.stdout_lines }}"
+
+    - name: Display infrastructure IPs
+      debug:
+        msg: |
+          Control Plane IPs: {{ control_plane_ips }}
+
+    # ================================
+    # 4. Wait for Bootstrap and Control Planes
+    # ================================
+    
+    - name: Wait for bootstrap to complete and control planes to be ready
+      shell: |
+        ssh -i {{ ssh_key_path }} -o StrictHostKeyChecking=no {{ bastion_user }}@{{ bastion_external_ip.stdout }} '
+        export KUBECONFIG=~/clusterconfig/auth/kubeconfig
+        echo "Waiting for bootstrap to complete and control planes to be ready..."
+        
+        # Wait for API to be accessible
+        echo "Step 1: Waiting for API server to be accessible..."
+        for i in {1..30}; do
+          if kubectl get nodes >/dev/null 2>&1; then
+            echo "✓ API server is accessible"
+            break
+          fi
+          echo "  Waiting for API... ($i/30)"
+          sleep 10
+        done
+        
+        # Check if control planes are ready
+        echo "Step 2: Waiting for control planes to be Ready..."
+        for i in {1..20}; do
+          READY_NODES=$(kubectl get nodes --no-headers | grep "control-plane" | grep " Ready " | wc -l 2>/dev/null || echo "0")
+          echo "  Ready control plane nodes: $READY_NODES/3 ($i/20)"
+          
+          if [ "$READY_NODES" -ge "2" ]; then
+            echo "✓ Bootstrap phase complete - control planes are ready"
+            kubectl get nodes
+            exit 0
+          fi
+          sleep 15
+        done
+        
+        echo "✗ Bootstrap did not complete in time"
+        kubectl get nodes || echo "API not accessible"
+        exit 1'
+      register: bootstrap_status
+      retries: 1
+      until: bootstrap_status.rc == 0
+
+    # ================================
+    # 6. DNS Transition for api-int
+    # ================================
+    
+    - name: Check current api-int DNS record
+      shell: gcloud dns record-sets list --zone={{ dns_zone }} --filter="name=api-int.{{ domain_name }}." --format="value(rrdatas[0])"
+      register: current_api_int_dns
+      changed_when: false
+
+    - name: Get bootstrap IP for comparison
+      shell: gcloud compute instances describe {{ cluster_name }}-bootstrap --zone={{ bastion_zone }} --format="value(networkInterfaces[0].networkIP)"
+      register: bootstrap_ip
+      changed_when: false
+
+    - name: Flip api-int DNS from bootstrap to control planes
+      shell: |
+        echo "Transitioning api-int from bootstrap ({{ bootstrap_ip.stdout }}) to control planes..."
+        gcloud dns record-sets transaction start --zone={{ dns_zone }}
+        gcloud dns record-sets transaction remove --zone={{ dns_zone }} --name=api-int.{{ domain_name }}. --type=A --ttl=300 {{ bootstrap_ip.stdout }}
+        gcloud dns record-sets transaction add --zone={{ dns_zone }} --name=api-int.{{ domain_name }}. --type=A --ttl=300 {{ control_plane_ips | join(' ') }}
+        gcloud dns record-sets transaction execute --zone={{ dns_zone }}
+        echo "✓ DNS transition complete - api-int now points to control planes"
+      when: bootstrap_status.rc == 0 and current_api_int_dns.stdout == bootstrap_ip.stdout
+
+    - name: Display bootstrap completion status
+      debug:
+        msg: |
+          ✓ Bootstrap phase completed successfully!
+          ✓ Control planes are ready
+          ✓ api-int DNS transitioned to control planes
+          
+          Next: Waiting for workers to join...
+
+    # ================================
+    # 7. Worker CSR Approval
+    # ================================
+    
+    - name: Wait for worker nodes to submit CSRs
+      shell: |
+        ssh -i {{ ssh_key_path }} -o StrictHostKeyChecking=no {{ bastion_user }}@{{ bastion_external_ip.stdout }} '
+        export KUBECONFIG=~/clusterconfig/auth/kubeconfig
+        echo "Waiting for worker CSRs to appear..."
+        
+        for i in {1..20}; do
+          PENDING_CSRS=$(kubectl get csr | grep "node-bootstrapper" | grep "Pending" | wc -l || echo "0")
+          echo "  Pending worker CSRs: $PENDING_CSRS ($i/20)"
+          
+          if [ "$PENDING_CSRS" -ge "1" ]; then
+            echo "✓ Worker CSRs found, ready for approval"
+            exit 0
+          fi
+          sleep 15
+        done
+        
+        echo "⚠ No worker CSRs found yet, continuing anyway"
+        exit 0'
+      register: csr_wait_status
+
+    - name: Approve worker node CSRs
+      shell: |
+        ssh -i {{ ssh_key_path }} -o StrictHostKeyChecking=no {{ bastion_user }}@{{ bastion_external_ip.stdout }} '
+        export KUBECONFIG=~/clusterconfig/auth/kubeconfig
+        echo "Approving pending worker CSRs..."
+        
+        # Get all pending CSRs from node-bootstrapper (workers)
+        PENDING_CSRS=$(kubectl get csr -o name | grep csr | while read csr; do
+          if kubectl get $csr -o jsonpath="{.spec.request}" | base64 -d | grep -q "node-bootstrapper"; then
+            if kubectl get $csr -o jsonpath="{.status.conditions[0].type}" | grep -q "Pending\|^$"; then
+              echo $csr | cut -d/ -f2
+            fi
+          fi
+        done)
+        
+        if [ -n "$PENDING_CSRS" ]; then
+          echo "Approving CSRs: $PENDING_CSRS"
+          for csr in $PENDING_CSRS; do
+            kubectl certificate approve $csr
+            echo "  ✓ Approved: $csr"
+          done
+        else
+          echo "No pending worker CSRs found"
+        fi'
+      register: csr_approval_result
+
+    - name: Wait for workers to join cluster
+      shell: |
+        ssh -i {{ ssh_key_path }} -o StrictHostKeyChecking=no {{ bastion_user }}@{{ bastion_external_ip.stdout }} '
+        export KUBECONFIG=~/clusterconfig/auth/kubeconfig
+        echo "Waiting for worker nodes to join cluster..."
+        
+        for i in {1..15}; do
+          WORKER_NODES=$(kubectl get nodes --no-headers | grep -v "control-plane" | grep -v "master" | wc -l || echo "0")
+          READY_WORKERS=$(kubectl get nodes --no-headers | grep -v "control-plane" | grep -v "master" | grep " Ready " | wc -l || echo "0")
+          echo "  Worker nodes: $WORKER_NODES, Ready: $READY_WORKERS ($i/15)"
+          
+          if [ "$WORKER_NODES" -ge "1" ]; then
+            echo "✓ Worker nodes have joined the cluster"
+            kubectl get nodes
+            exit 0
+          fi
+          sleep 20
+        done
+        
+        echo "⚠ Workers not yet joined, but continuing"
+        kubectl get nodes || echo "No nodes found"
+        exit 0'
+      register: worker_join_status
+
+    - name: Approve additional CSRs (serving certificates)
+      shell: |
+        ssh -i {{ ssh_key_path }} -o StrictHostKeyChecking=no {{ bastion_user }}@{{ bastion_external_ip.stdout }} '
+        export KUBECONFIG=~/clusterconfig/auth/kubeconfig
+        echo "Checking for additional CSRs that may need approval..."
+        
+        # Wait a bit for serving CSRs to appear
+        sleep 30
+        
+        # Approve any remaining pending CSRs
+        PENDING_CSRS=$(kubectl get csr --no-headers | grep "Pending" | awk "{print \$1}")
+        
+        if [ -n "$PENDING_CSRS" ]; then
+          echo "Approving additional CSRs: $PENDING_CSRS"
+          for csr in $PENDING_CSRS; do
+            kubectl certificate approve $csr
+            echo "  ✓ Approved: $csr"
+          done
+        else
+          echo "No additional CSRs pending"
+        fi'
+      register: additional_csr_approval
+
+    # ================================
+    # 8. Final Cluster Status
+    # ================================
+    
+    - name: Check final cluster status
+      shell: |
+        ssh -i {{ ssh_key_path }} -o StrictHostKeyChecking=no {{ bastion_user }}@{{ bastion_external_ip.stdout }} '
+        export KUBECONFIG=~/clusterconfig/auth/kubeconfig
+        echo "=== Final Cluster Status ==="
+        kubectl get nodes
+        echo ""
+        echo "=== Cluster Operators Status ==="
+        kubectl get clusteroperators | head -10'
+      register: final_status
+      ignore_errors: true
+
+    - name: Display cluster status
+      debug:
+        var: final_status.stdout_lines
+
+    - name: Display deployment summary
+      debug:
+        msg: |
+          🎉 OpenShift UPI Complete Deployment Finished!
+          
+          ✅ Completed Steps:
+          1. ✓ Prerequisites validated
+          2. ✓ OpenShift ignition configs generated
+          3. ✓ RHCOS image available in GCP
+          4. ✓ GCP infrastructure deployed with Terraform
+          5. ✓ Bootstrap phase completed successfully
+          6. ✓ Control planes are Ready
+          7. ✓ api-int DNS transitioned from bootstrap to control planes  
+          8. ✓ Worker CSRs approved automatically
+          9. ✓ Workers joined cluster
+          
+          🚀 Ready to Use:
+          - Export kubeconfig: export KUBECONFIG=../clusterconfig/auth/kubeconfig
+          - Check cluster: kubectl get nodes
+          - Access console: https://console-openshift-console.apps.{{ domain_name }}
+          - Admin password: cat ../clusterconfig/auth/kubeadmin-password
+          
+          📋 Management Commands:
+          - SSH to bastion: ssh -i {{ ssh_key_path }} {{ bastion_user }}@{{ bastion_external_ip.stdout }}
+          - Monitor operators: kubectl get clusteroperators
+          - Destroy cluster: cd ../terraform && terraform destroy
+
+

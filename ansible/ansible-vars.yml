@@ -1,0 +1,42 @@
+---
+# OpenShift UPI GCP Ansible Variables
+# Copy this file and customize for your environment
+
+# GCP Configuration
+gcp_project_id: "{{ ansible_env.GCP_PROJECT | default('your-project-id') }}"
+
+# OpenShift Configuration  
+cluster_name: "ocp"
+domain_name: "ocp.j7ql2.gcp.redhatworkshops.io"
+
+# Infrastructure Configuration
+bastion_zone: "us-central1-a"
+bastion_user: "ubuntu"
+
+# DNS Configuration
+dns_zone: "ocp-zone"
+
+# File Paths
+ssh_key_path: "../keys/id_rsa"
+kubeconfig_path: "../clusterconfig/auth/kubeconfig"
+
+# Zone Configuration for multi-zone deployment
+control_plane_zones:
+  - "us-central1-a"
+  - "us-central1-b" 
+  - "us-central1-c"
+
+worker_zones:
+  - "us-central1-a"
+  - "us-central1-b"
+  - "us-central1-c"
+
+# RHCOS Configuration
+rhcos_version: "4.19.10"
+rhcos_image_name: "rhcos-4-19-10"
+
+# Timeouts (seconds)
+api_ready_timeout: 300
+csr_approval_retries: 5
+
+
