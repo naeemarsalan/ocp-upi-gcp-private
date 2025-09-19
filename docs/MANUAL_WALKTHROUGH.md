@@ -9,7 +9,7 @@ This walkthrough covers the complete manual process:
 2. Service account creation and permissions
 3. OpenShift ignition config generation
 4. RHCOS image preparation
-5. Infrastructure deployment with Terraform
+5. Infrastructure deployment with gcloud
 6. Bootstrap monitoring and DNS transitions
 7. Worker node joining and CSR approval
 8. Cluster validation and access
@@ -23,7 +23,6 @@ This walkthrough covers the complete manual process:
 ```bash
 # Check all required tools are installed
 gcloud --version
-terraform --version
 ansible --version
 kubectl version --client
 ssh -V
@@ -76,42 +75,18 @@ cat keys/id_rsa.pub
 ### 2.1 Create Service Accounts
 
 ```bash
-# Create Terraform service account for infrastructure deployment
-gcloud iam service-accounts create openshift-terraform \
-    --display-name="OpenShift Terraform Service Account" \
-    --description="Service account for Terraform OpenShift UPI deployment"
-
 # Create OpenShift node service account for cluster operations
 gcloud iam service-accounts create ocp-node-sa \
     --display-name="OpenShift Node Service Account" \
     --description="Service account for OpenShift cluster nodes"
 
-# Verify service accounts created
-gcloud iam service-accounts list --filter="email~(openshift|ocp-node)"
+# Verify service account created
+gcloud iam service-accounts list --filter="email~ocp-node-sa"
 ```
 
-### 2.2 Assign IAM Roles
+### 2.2 Assign IAM Roles to Node Service Account
 
 ```bash
-# Terraform service account permissions (temporary, for infrastructure deployment)
-TERRAFORM_SA="openshift-terraform@${PROJECT_ID}.iam.gserviceaccount.com"
-
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:${TERRAFORM_SA}" \
-    --role="roles/compute.admin"
-
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:${TERRAFORM_SA}" \
-    --role="roles/dns.admin"
-
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:${TERRAFORM_SA}" \
-    --role="roles/storage.admin"
-
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:${TERRAFORM_SA}" \
-    --role="roles/iam.serviceAccountUser"
-
 # OpenShift node service account permissions (ongoing cluster operations)
 NODE_SA="ocp-node-sa@${PROJECT_ID}.iam.gserviceaccount.com"
 
@@ -132,21 +107,9 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
     --role="roles/logging.logWriter"
 ```
 
-### 2.3 Create Service Account Keys
+### 2.3 Authentication Notes
 
-```bash
-# Create and download Terraform service account key
-gcloud iam service-accounts keys create terraform-sa-key.json \
-    --iam-account="${TERRAFORM_SA}"
-
-# Set permissions and environment variable
-chmod 600 terraform-sa-key.json
-export GOOGLE_APPLICATION_CREDENTIALS="$(pwd)/terraform-sa-key.json"
-
-# Verify authentication
-gcloud auth activate-service-account --key-file=terraform-sa-key.json
-gcloud compute zones list --limit=1  # Test access
-```
+No service account keys are required for this walkthrough. Use your user credentials via `gcloud auth login`; the node service account will be attached to VMs as needed.
 
 ## Phase 3: OpenShift Configuration
 
@@ -283,87 +246,260 @@ if ! gcloud compute images describe rhcos-4-19-10 >/dev/null 2>&1; then
 fi
 ```
 
-## Phase 5: Terraform Infrastructure Deployment
+## Phase 5: Infrastructure Deployment with gcloud
 
-### 5.1 Configure Terraform Variables
+### 5.1 Set Environment Variables
 
 ```bash
-# Copy terraform variables template
-cp terraform/terraform.tfvars.example terraform/terraform.tfvars
+# Core variables
+export PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project)}"
+export CLUSTER_NAME="ocp"
+export REGION="us-central1"
+export ZONES=("us-central1-a" "us-central1-b" "us-central1-c")
+export DOMAIN="ocp.example.com"   # Update with your domain
 
-# Edit with your values
-cat > terraform/terraform.tfvars << EOF
-# Your GCP project ID
-project_id = "$PROJECT_ID"
+# Network & CIDRs
+export SUBNET_CIDRS=("10.0.1.0/24" "10.0.2.0/24" "10.0.3.0/24")
+export POD_CIDRS=("10.128.0.0/16" "10.129.0.0/16" "10.130.0.0/16")
+export SERVICE_CIDR="172.30.0.0/16"
 
-# Cluster configuration
-cluster_name = "ocp"
-domain_name = "ocp.example.com"  # Update with your domain
+# Compute sizing
+export CONTROL_TYPE="e2-standard-4"
+export WORKER_TYPE="e2-standard-4"
+export CONTROL_DISK_GB=120
+export WORKER_DISK_GB=120
 
-# GCP configuration
-region = "us-central1"
-zones = ["us-central1-a", "us-central1-b", "us-central1-c"]
+# Derived variables
+export NETWORK="${CLUSTER_NAME}-vpc"
+export NODE_SA="ocp-node-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+```
 
-# SSH key (content of keys/id_rsa.pub)
-ssh_public_key = "$(cat keys/id_rsa.pub)"
+### 5.2 Create Network, Subnets, Cloud Router and NAT
 
-# Machine types (optional, defaults shown)
-control_plane_machine_type = "e2-standard-4"
-worker_machine_type = "e2-standard-4"
-bastion_machine_type = "e2-micro"
+```bash
+# VPC (custom subnets, regional routing)
+gcloud compute networks create ${NETWORK} \
+  --subnet-mode=custom \
+  --bgp-routing-mode=regional
 
-# Network configuration (optional, defaults shown)
-subnet_cidrs = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
-pod_cidrs = ["10.128.0.0/16", "10.129.0.0/16", "10.130.0.0/16"]
-service_cidr = "172.30.0.0/16"
+# Subnets (one per zone) with private Google access and a per-AZ pod secondary range
+for i in 0 1 2; do
+  gcloud compute networks subnets create ${CLUSTER_NAME}-subnet-$((i+1)) \
+    --network=${NETWORK} \
+    --region=${REGION} \
+    --range=${SUBNET_CIDRS[$i]} \
+    --enable-private-ip-google-access \
+    --secondary-range pod-cidr-$((i+1))=${POD_CIDRS[$i]}
+done
 
-# OpenShift version
-ocp_version = "4.19"
-rhcos_version = "4.19.10"
+# Cloud Router and NAT for outbound internet
+gcloud compute routers create ${CLUSTER_NAME}-router \
+  --region=${REGION} \
+  --network=${NETWORK}
+
+gcloud compute routers nats create ${CLUSTER_NAME}-nat \
+  --router=${CLUSTER_NAME}-router \
+  --region=${REGION} \
+  --nat-all-subnet-ip-ranges \
+  --auto-allocate-nat-external-ips \
+  --enable-logging --log-filter=errors-only
+```
+
+### 5.3 Create Firewall Rules
+
+```bash
+# Allow internal cluster communication (tcp/udp/icmp)
+gcloud compute firewall-rules create ${CLUSTER_NAME}-allow-internal \
+  --network=${NETWORK} \
+  --allow=tcp,udp,icmp \
+  --source-ranges=${SUBNET_CIDRS[0]},${SUBNET_CIDRS[1]},${SUBNET_CIDRS[2]},${POD_CIDRS[0]},${POD_CIDRS[1]},${POD_CIDRS[2]},${SERVICE_CIDR} \
+  --target-tags=${CLUSTER_NAME}-cluster
+
+# Allow SSH from internal ranges (adjust as needed)
+gcloud compute firewall-rules create ${CLUSTER_NAME}-allow-ssh \
+  --network=${NETWORK} \
+  --allow=tcp:22 \
+  --source-ranges=10.0.0.0/8 \
+  --target-tags=${CLUSTER_NAME}-cluster
+
+# Allow API server (6443) to control plane
+gcloud compute firewall-rules create ${CLUSTER_NAME}-allow-api-server \
+  --network=${NETWORK} \
+  --allow=tcp:6443 \
+  --source-ranges=10.0.0.0/8 \
+  --target-tags=${CLUSTER_NAME}-control-plane
+
+# Allow Machine Config Server (22623) to bootstrap and control plane
+gcloud compute firewall-rules create ${CLUSTER_NAME}-allow-mcs \
+  --network=${NETWORK} \
+  --allow=tcp:22623 \
+  --source-ranges=${SUBNET_CIDRS[0]},${SUBNET_CIDRS[1]},${SUBNET_CIDRS[2]} \
+  --target-tags=${CLUSTER_NAME}-control-plane,${CLUSTER_NAME}-bootstrap
+
+# Allow Ingress (HTTP/HTTPS) to workers
+gcloud compute firewall-rules create ${CLUSTER_NAME}-allow-ingress \
+  --network=${NETWORK} \
+  --allow=tcp:80,tcp:443 \
+  --source-ranges=0.0.0.0/0 \
+  --target-tags=${CLUSTER_NAME}-worker
+
+# Allow etcd between control planes
+gcloud compute firewall-rules create ${CLUSTER_NAME}-allow-etcd \
+  --network=${NETWORK} \
+  --allow=tcp:2379-2380 \
+  --source-tags=${CLUSTER_NAME}-control-plane \
+  --target-tags=${CLUSTER_NAME}-control-plane
+
+# Allow kubelet from control planes to all nodes
+gcloud compute firewall-rules create ${CLUSTER_NAME}-allow-kubelet \
+  --network=${NETWORK} \
+  --allow=tcp:10250 \
+  --source-tags=${CLUSTER_NAME}-control-plane \
+  --target-tags=${CLUSTER_NAME}-cluster
+```
+
+### 5.4 Optional: Bastion Host Access Rules
+
+```bash
+# SSH to bastion from anywhere (optional)
+gcloud compute firewall-rules create ${CLUSTER_NAME}-allow-bastion-ssh \
+  --network=${NETWORK} \
+  --allow=tcp:22 \
+  --source-ranges=0.0.0.0/0 \
+  --target-tags=${CLUSTER_NAME}-bastion
+
+# Allow bastion to access internal cluster ports
+gcloud compute firewall-rules create ${CLUSTER_NAME}-bastion-to-internal \
+  --network=${NETWORK} \
+  --allow=tcp:22,tcp:80,tcp:443,tcp:6443,tcp:22623 \
+  --source-tags=${CLUSTER_NAME}-bastion \
+  --target-tags=${CLUSTER_NAME}-cluster
+```
+
+### 5.5 Prepare Bootstrap Ignition Delivery (GCS)
+
+```bash
+# Create a bucket and upload bootstrap.ign (pointer pattern to bypass metadata limit)
+export BOOTSTRAP_BUCKET="${CLUSTER_NAME}-bootstrap-ignition-$(openssl rand -hex 4)"
+gsutil mb -l ${REGION} gs://${BOOTSTRAP_BUCKET}
+
+# Make objects publicly readable so RHCOS can fetch early in boot (restrict later)
+gsutil iam ch allUsers:objectViewer gs://${BOOTSTRAP_BUCKET}
+
+# Upload bootstrap ignition
+gsutil cp clusterconfig/bootstrap.ign gs://${BOOTSTRAP_BUCKET}/bootstrap.ign
+
+# Create a tiny pointer ignition referencing the GCS object
+mkdir -p artifacts
+cat > artifacts/bootstrap-pointer.ign <<EOF
+{ "ignition": { "version": "3.2.0", "config": { "merge": [ { "source": "https://storage.googleapis.com/${BOOTSTRAP_BUCKET}/bootstrap.ign" } ] } } }
 EOF
-
-# Review and edit the file
-vi terraform/terraform.tfvars
 ```
 
-### 5.2 Deploy Infrastructure
+### 5.6 Create Compute Instances
 
 ```bash
-# Change to terraform directory
-cd terraform
+# Bootstrap (no external IP)
+gcloud compute instances create ${CLUSTER_NAME}-bootstrap \
+  --zone=${ZONES[0]} \
+  --machine-type=${CONTROL_TYPE} \
+  --image=rhcos-4-19-10 \
+  --image-project=${PROJECT_ID} \
+  --subnet=${CLUSTER_NAME}-subnet-1 \
+  --no-address \
+  --tags=${CLUSTER_NAME}-bootstrap,${CLUSTER_NAME}-cluster \
+  --scopes=cloud-platform \
+  --service-account=${NODE_SA} \
+  --metadata-from-file=user-data=artifacts/bootstrap-pointer.ign \
+  --create-disk=auto-delete=yes,boot=yes,device-name=${CLUSTER_NAME}-bootstrap,image-project=${PROJECT_ID},image=rhcos-4-19-10,mode=rw,size=${CONTROL_DISK_GB},type=pd-ssd
 
-# Initialize Terraform
-terraform init
+# Control planes (3) across zones (no external IPs)
+for i in 0 1 2; do
+  gcloud compute instances create ${CLUSTER_NAME}-control-$((i+1)) \
+    --zone=${ZONES[$i]} \
+    --machine-type=${CONTROL_TYPE} \
+    --image=rhcos-4-19-10 \
+    --image-project=${PROJECT_ID} \
+    --subnet=${CLUSTER_NAME}-subnet-$((i+1)) \
+    --no-address \
+    --tags=${CLUSTER_NAME}-control-plane,${CLUSTER_NAME}-cluster \
+    --scopes=cloud-platform \
+    --service-account=${NODE_SA} \
+    --metadata-from-file=user-data=clusterconfig/master.ign \
+    --create-disk=auto-delete=yes,boot=yes,device-name=${CLUSTER_NAME}-control-$((i+1)),image-project=${PROJECT_ID},image=rhcos-4-19-10,mode=rw,size=${CONTROL_DISK_GB},type=pd-ssd
+done
 
-# Plan the deployment (review carefully)
-terraform plan -out=tfplan
+# Workers (3) across zones (no external IPs)
+for i in 0 1 2; do
+  gcloud compute instances create ${CLUSTER_NAME}-worker-$((i+1)) \
+    --zone=${ZONES[$i]} \
+    --machine-type=${WORKER_TYPE} \
+    --image=rhcos-4-19-10 \
+    --image-project=${PROJECT_ID} \
+    --subnet=${CLUSTER_NAME}-subnet-$((i+1)) \
+    --no-address \
+    --tags=${CLUSTER_NAME}-worker,${CLUSTER_NAME}-cluster \
+    --scopes=cloud-platform \
+    --service-account=${NODE_SA} \
+    --metadata-from-file=user-data=clusterconfig/worker.ign \
+    --create-disk=auto-delete=yes,boot=yes,device-name=${CLUSTER_NAME}-worker-$((i+1)),image-project=${PROJECT_ID},image=rhcos-4-19-10,mode=rw,size=${WORKER_DISK_GB},type=pd-ssd
+done
 
-# Apply the infrastructure
-echo "Deploying infrastructure (this takes 10-15 minutes)..."
-terraform apply tfplan
-
-# Verify deployment
-terraform output
-
-# Return to main directory
-cd ..
+# Optional Bastion (with external IP) for admin access
+gcloud compute instances create ${CLUSTER_NAME}-bastion \
+  --zone=${ZONES[0]} \
+  --machine-type=e2-micro \
+  --image-family=ubuntu-2204-lts \
+  --image-project=ubuntu-os-cloud \
+  --subnet=${CLUSTER_NAME}-subnet-1 \
+  --tags=${CLUSTER_NAME}-bastion \
+  --metadata="ssh-keys=ubuntu:$(cat keys/id_rsa.pub)" \
+  --create-disk=auto-delete=yes,boot=yes,device-name=${CLUSTER_NAME}-bastion,size=20,type=pd-standard
 ```
 
-### 5.3 Verify Infrastructure
+### 5.7 Configure Private DNS
 
 ```bash
-# Check all instances are running
-gcloud compute instances list --filter="name~ocp-" --format="table(name,status,zone.basename(),networkInterfaces[0].networkIP:label=INTERNAL_IP)"
+# Create private managed zone
+gcloud dns managed-zones create ${CLUSTER_NAME}-zone \
+  --dns-name="${DOMAIN}." \
+  --visibility=private \
+  --private-visibility-network=${NETWORK}
+
+# Collect internal IPs
+export BOOTSTRAP_IP=$(gcloud compute instances describe ${CLUSTER_NAME}-bootstrap --zone=${ZONES[0]} --format='get(networkInterfaces[0].networkIP)')
+export CONTROL_IP1=$(gcloud compute instances describe ${CLUSTER_NAME}-control-1 --zone=${ZONES[0]} --format='get(networkInterfaces[0].networkIP)')
+export CONTROL_IP2=$(gcloud compute instances describe ${CLUSTER_NAME}-control-2 --zone=${ZONES[1]} --format='get(networkInterfaces[0].networkIP)')
+export CONTROL_IP3=$(gcloud compute instances describe ${CLUSTER_NAME}-control-3 --zone=${ZONES[2]} --format='get(networkInterfaces[0].networkIP)')
+export WORKER_IP1=$(gcloud compute instances describe ${CLUSTER_NAME}-worker-1 --zone=${ZONES[0]} --format='get(networkInterfaces[0].networkIP)')
+export WORKER_IP2=$(gcloud compute instances describe ${CLUSTER_NAME}-worker-2 --zone=${ZONES[1]} --format='get(networkInterfaces[0].networkIP)')
+export WORKER_IP3=$(gcloud compute instances describe ${CLUSTER_NAME}-worker-3 --zone=${ZONES[2]} --format='get(networkInterfaces[0].networkIP)')
+
+# Create initial records (api -> control planes, api-int -> bootstrap, *.apps -> workers)
+gcloud dns record-sets transaction start --zone=${CLUSTER_NAME}-zone
+gcloud dns record-sets transaction add --zone=${CLUSTER_NAME}-zone \
+  --name="api.${DOMAIN}." --type=A --ttl=300 ${CONTROL_IP1} ${CONTROL_IP2} ${CONTROL_IP3}
+gcloud dns record-sets transaction add --zone=${CLUSTER_NAME}-zone \
+  --name="api-int.${DOMAIN}." --type=A --ttl=300 ${BOOTSTRAP_IP}
+gcloud dns record-sets transaction add --zone=${CLUSTER_NAME}-zone \
+  --name="*.apps.${DOMAIN}." --type=A --ttl=300 ${WORKER_IP1} ${WORKER_IP2} ${WORKER_IP3}
+gcloud dns record-sets transaction execute --zone=${CLUSTER_NAME}-zone
+
+# Capture bastion external IP for later use
+export BASTION_IP=$(gcloud compute instances describe ${CLUSTER_NAME}-bastion --zone=${ZONES[0]} --format='get(networkInterfaces[0].accessConfigs[0].natIP)')
+echo "Bastion IP: ${BASTION_IP}"
+echo "Bootstrap IP: ${BOOTSTRAP_IP}"
+```
+
+### 5.8 Verify Resources
+
+```bash
+# Check instances
+gcloud compute instances list --filter="name~${CLUSTER_NAME}-" --format="table(name,status,zone.basename(),networkInterfaces[0].networkIP:label=INTERNAL_IP)"
 
 # Check DNS zone and records
-gcloud dns managed-zones list --filter="name=ocp-zone"
-gcloud dns record-sets list --zone=ocp-zone
-
-# Get important IPs for later use
-export BASTION_IP=$(terraform -chdir=terraform output -raw bastion_external_ip)
-export BOOTSTRAP_IP=$(gcloud compute instances describe ocp-bootstrap --zone=us-central1-a --format='get(networkInterfaces[0].networkIP)')
-echo "Bastion IP: $BASTION_IP"
-echo "Bootstrap IP: $BOOTSTRAP_IP"
+gcloud dns managed-zones list --filter="name=${CLUSTER_NAME}-zone"
+gcloud dns record-sets list --zone=${CLUSTER_NAME}-zone
 ```
 
 ## Phase 6: Bootstrap and Control Plane Setup
@@ -435,27 +571,27 @@ Once control planes are ready, update DNS to point API endpoints to control plan
 
 ```bash
 # Get control plane IPs
-CONTROL_IP1=$(gcloud compute instances describe ocp-control-1 --zone=us-central1-a --format='get(networkInterfaces[0].networkIP)')
-CONTROL_IP2=$(gcloud compute instances describe ocp-control-2 --zone=us-central1-b --format='get(networkInterfaces[0].networkIP)')
-CONTROL_IP3=$(gcloud compute instances describe ocp-control-3 --zone=us-central1-c --format='get(networkInterfaces[0].networkIP)')
+CONTROL_IP1=$(gcloud compute instances describe ${CLUSTER_NAME}-control-1 --zone=${ZONES[0]} --format='get(networkInterfaces[0].networkIP)')
+CONTROL_IP2=$(gcloud compute instances describe ${CLUSTER_NAME}-control-2 --zone=${ZONES[1]} --format='get(networkInterfaces[0].networkIP)')
+CONTROL_IP3=$(gcloud compute instances describe ${CLUSTER_NAME}-control-3 --zone=${ZONES[2]} --format='get(networkInterfaces[0].networkIP)')
 
 echo "Control plane IPs: $CONTROL_IP1, $CONTROL_IP2, $CONTROL_IP3"
 
 # Update api-int DNS record to point to control planes
 echo "Updating api-int DNS record..."
-gcloud dns record-sets transaction start --zone=ocp-zone
-gcloud dns record-sets transaction remove --zone=ocp-zone \
-    --name=api-int.ocp.example.com. \
+gcloud dns record-sets transaction start --zone=${CLUSTER_NAME}-zone
+gcloud dns record-sets transaction remove --zone=${CLUSTER_NAME}-zone \
+    --name=api-int.${DOMAIN}. \
     --type=A --ttl=300 $BOOTSTRAP_IP
-gcloud dns record-sets transaction add --zone=ocp-zone \
-    --name=api-int.ocp.example.com. \
+gcloud dns record-sets transaction add --zone=${CLUSTER_NAME}-zone \
+    --name=api-int.${DOMAIN}. \
     --type=A --ttl=300 $CONTROL_IP1 $CONTROL_IP2 $CONTROL_IP3
-gcloud dns record-sets transaction execute --zone=ocp-zone
+gcloud dns record-sets transaction execute --zone=${CLUSTER_NAME}-zone
 
 echo "DNS transition completed!"
 
 # Verify DNS update
-gcloud dns record-sets list --zone=ocp-zone | grep api-int
+gcloud dns record-sets list --zone=${CLUSTER_NAME}-zone | grep api-int
 ```
 
 ## Phase 8: Worker Node Setup
@@ -566,23 +702,23 @@ ssh -i keys/id_rsa ubuntu@$BASTION_IP "
 
 ```bash
 # Get worker IPs and update apps DNS
-WORKER_IP1=$(gcloud compute instances describe ocp-worker-1 --zone=us-central1-a --format='get(networkInterfaces[0].networkIP)')
-WORKER_IP2=$(gcloud compute instances describe ocp-worker-2 --zone=us-central1-b --format='get(networkInterfaces[0].networkIP)')
-WORKER_IP3=$(gcloud compute instances describe ocp-worker-3 --zone=us-central1-c --format='get(networkInterfaces[0].networkIP)')
+WORKER_IP1=$(gcloud compute instances describe ${CLUSTER_NAME}-worker-1 --zone=${ZONES[0]} --format='get(networkInterfaces[0].networkIP)')
+WORKER_IP2=$(gcloud compute instances describe ${CLUSTER_NAME}-worker-2 --zone=${ZONES[1]} --format='get(networkInterfaces[0].networkIP)')
+WORKER_IP3=$(gcloud compute instances describe ${CLUSTER_NAME}-worker-3 --zone=${ZONES[2]} --format='get(networkInterfaces[0].networkIP)')
 
 echo "Worker IPs: $WORKER_IP1, $WORKER_IP2, $WORKER_IP3"
 
 # Update apps DNS to point to workers
 echo "Updating *.apps DNS record..."
-gcloud dns record-sets transaction start --zone=ocp-zone
+gcloud dns record-sets transaction start --zone=${CLUSTER_NAME}-zone
 # Remove any existing apps record (this might fail if it doesn't exist)
-gcloud dns record-sets transaction remove --zone=ocp-zone \
-    --name=*.apps.ocp.example.com. \
+gcloud dns record-sets transaction remove --zone=${CLUSTER_NAME}-zone \
+    --name=*.apps.${DOMAIN}. \
     --type=A --ttl=300 10.0.1.10 2>/dev/null || true
-gcloud dns record-sets transaction add --zone=ocp-zone \
-    --name=*.apps.ocp.example.com. \
+gcloud dns record-sets transaction add --zone=${CLUSTER_NAME}-zone \
+    --name=*.apps.${DOMAIN}. \
     --type=A --ttl=300 $WORKER_IP1 $WORKER_IP2 $WORKER_IP3
-gcloud dns record-sets transaction execute --zone=ocp-zone
+gcloud dns record-sets transaction execute --zone=${CLUSTER_NAME}-zone
 
 # Test console access
 echo "Testing console access..."
@@ -638,36 +774,25 @@ echo "To use: export KUBECONFIG=$(pwd)/kubeconfig"
 ### 10.1 Remove Bootstrap Node (Optional)
 
 ```bash
-# Once cluster is stable, you can remove the bootstrap node
+# Once cluster is stable, you can remove the bootstrap node and cleanup GCS
 echo "Bootstrap node can be safely removed now"
-echo "To remove bootstrap:"
-echo "  cd terraform"
-echo "  terraform destroy -target=google_compute_instance.bootstrap"
-echo "  terraform destroy -target=google_storage_bucket.bootstrap_ignition"
-echo "  terraform destroy -target=google_storage_bucket_object.bootstrap_ignition"
+gcloud compute instances delete ${CLUSTER_NAME}-bootstrap --zone=${ZONES[0]} --quiet
+
+# Remove bootstrap ignition object and bucket (if no longer needed)
+gsutil rm gs://${BOOTSTRAP_BUCKET}/bootstrap.ign || true
+gsutil rb gs://${BOOTSTRAP_BUCKET} || true
 ```
 
-### 10.2 Reduce Service Account Permissions
+### 10.2 Tighten Access and Permissions
 
 ```bash
-# Remove elevated Terraform permissions (security best practice)
-echo "Removing elevated Terraform service account permissions..."
-TERRAFORM_SA="openshift-terraform@${PROJECT_ID}.iam.gserviceaccount.com"
+# Optionally remove public read from the bootstrap bucket (if you kept it)
+if [ -n "${BOOTSTRAP_BUCKET}" ]; then
+  echo "Removing public read access from gs://${BOOTSTRAP_BUCKET} (if present)"
+  gsutil iam ch -d allUsers:objectViewer gs://${BOOTSTRAP_BUCKET} || true
+fi
 
-gcloud projects remove-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:${TERRAFORM_SA}" \
-    --role="roles/compute.admin"
-
-gcloud projects remove-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:${TERRAFORM_SA}" \
-    --role="roles/dns.admin"
-
-gcloud projects remove-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:${TERRAFORM_SA}" \
-    --role="roles/storage.admin"
-
-echo "Terraform service account permissions reduced"
-echo "OpenShift node service account retains minimal required permissions"
+echo "OpenShift node service account retains minimal required permissions (viewer, logging, monitoring). Review and tighten as needed."
 ```
 
 ## Troubleshooting Common Issues
