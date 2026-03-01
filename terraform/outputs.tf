@@ -114,6 +114,12 @@ output "operator_sa_key_path" {
   value       = local_file.openshift_operator_sa_key.filename
 }
 
+# Bastion Host
+output "bastion_external_ip" {
+  description = "External IP of the bastion host"
+  value       = var.enable_bastion ? google_compute_instance.bastion[0].network_interface[0].access_config[0].nat_ip : null
+}
+
 # Summary for OpenShift installation
 output "installation_summary" {
   description = "Summary of key information for OpenShift installation"

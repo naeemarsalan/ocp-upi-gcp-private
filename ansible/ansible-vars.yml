@@ -3,11 +3,11 @@
 # Copy this file and customize for your environment
 
 # GCP Configuration
-gcp_project_id: "openenv-h2zff"
+gcp_project_id: "openenv-vrmgr"
 
-# OpenShift Configuration  
+# OpenShift Configuration
 cluster_name: "ocp"
-domain_name: "ocp.h2zff.gcp.redhatworkshops.io"
+domain_name: "ocp.vrmgr.gcp.redhatworkshops.io"
 
 # Infrastructure Configuration
 bastion_zone: "us-central1-a"

@@ -48,6 +48,7 @@ sa.json
 *-key.json
 service-account-*.json
 google-credentials.json
+google.creds
 
 # Logs and Temporary Files
 .openshift_install.log

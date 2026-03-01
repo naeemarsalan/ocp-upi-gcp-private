@@ -235,17 +235,18 @@
       shell: |
         scp -i {{ ssh_key_path }} -o StrictHostKeyChecking=no {{ kubeconfig_path }} {{ bastion_user }}@{{ bastion_external_ip.stdout }}:~/clusterconfig/auth/kubeconfig
 
-    - name: Download kubectl on bastion
+    - name: Download oc CLI on bastion
       shell: |
         ssh -i {{ ssh_key_path }} -o StrictHostKeyChecking=no {{ bastion_user }}@{{ bastion_external_ip.stdout }} '
-        if ! command -v kubectl >/dev/null 2>&1; then
-          echo "Downloading kubectl..."
-          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-          chmod +x kubectl
-          sudo mv kubectl /usr/local/bin/
-          echo "kubectl installed"
+        if ! command -v oc >/dev/null 2>&1; then
+          echo "Downloading oc CLI..."
+          curl -LO "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz"
+          tar xzf openshift-client-linux.tar.gz oc kubectl
+          sudo mv oc kubectl /usr/local/bin/
+          rm -f openshift-client-linux.tar.gz
+          echo "oc CLI installed"
         else
-          echo "kubectl already installed"
+          echo "oc CLI already installed"
         fi'
 
     # ================================
@@ -282,7 +283,7 @@
         # Wait for API to be accessible (bootstrap takes 20-40 min)
         echo "Step 1: Waiting for API server to be accessible..."
         for i in {1..60}; do
-          if kubectl get nodes >/dev/null 2>&1; then
+          if oc get nodes >/dev/null 2>&1; then
             echo "✓ API server is accessible"
             break
           fi
@@ -293,55 +294,81 @@
         # Check if control planes are ready
         echo "Step 2: Waiting for control planes to be Ready..."
         for i in {1..60}; do
-          READY_NODES=$(kubectl get nodes --no-headers | grep "control-plane" | grep " Ready " | wc -l 2>/dev/null || echo "0")
+          READY_NODES=$(oc get nodes --no-headers | grep "control-plane" | grep " Ready " | wc -l 2>/dev/null || echo "0")
           echo "  Ready control plane nodes: $READY_NODES/3 ($i/60)"
 
           if [ "$READY_NODES" -ge "2" ]; then
             echo "✓ Bootstrap phase complete - control planes are ready"
-            kubectl get nodes
+            oc get nodes
             exit 0
           fi
           sleep 20
         done
 
         echo "✗ Bootstrap did not complete in time"
-        kubectl get nodes || echo "API not accessible"
+        oc get nodes || echo "API not accessible"
         exit 1'
       register: bootstrap_status
       retries: 1
       until: bootstrap_status.rc == 0
 
     # ================================
-    # 6. DNS Transition for api-int
+    # 6. DNS Transition for api-int and api
     # ================================
-    
-    - name: Check current api-int DNS record
-      shell: gcloud dns record-sets list --zone={{ dns_zone }} --filter="name=api-int.{{ domain_name }}." --format="value(rrdatas[0])"
-      register: current_api_int_dns
-      changed_when: false
 
     - name: Get bootstrap IP for comparison
       shell: gcloud compute instances describe {{ cluster_name }}-bootstrap --zone={{ bastion_zone }} --format="value(networkInterfaces[0].networkIP)"
       register: bootstrap_ip
       changed_when: false
 
+    - name: Wait for kube-apiserver to be running on at least 2 control planes
+      shell: |
+        ssh -i {{ ssh_key_path }} -o StrictHostKeyChecking=no {{ bastion_user }}@{{ bastion_external_ip.stdout }} '
+        export KUBECONFIG=~/clusterconfig/auth/kubeconfig
+        echo "Waiting for kube-apiserver on control planes before DNS flip..."
+        for i in {1..90}; do
+          API_UP=0
+          for ip in {{ control_plane_ips | join(" ") }}; do
+            status=$(curl -sk --connect-timeout 2 https://$ip:6443/healthz 2>&1)
+            if [ "$status" = "ok" ]; then
+              API_UP=$((API_UP + 1))
+            fi
+          done
+          echo "  kube-apiserver on CPs: $API_UP/3 ($i/90)"
+          if [ "$API_UP" -ge "2" ]; then
+            echo "✓ Safe to flip DNS"
+            exit 0
+          fi
+          sleep 20
+        done
+        echo "✗ Timed out waiting for kube-apiserver on control planes"
+        exit 1'
+      register: apiserver_wait
+      when: bootstrap_status.rc == 0
+
     - name: Flip api-int DNS from bootstrap to control planes
       shell: |
-        echo "Transitioning api-int from bootstrap ({{ bootstrap_ip.stdout }}) to control planes..."
-        gcloud dns record-sets transaction start --zone={{ dns_zone }}
-        gcloud dns record-sets transaction remove --zone={{ dns_zone }} --name=api-int.{{ domain_name }}. --type=A --ttl=300 {{ bootstrap_ip.stdout }}
-        gcloud dns record-sets transaction add --zone={{ dns_zone }} --name=api-int.{{ domain_name }}. --type=A --ttl=300 {{ control_plane_ips | join(' ') }}
-        gcloud dns record-sets transaction execute --zone={{ dns_zone }}
-        echo "✓ DNS transition complete - api-int now points to control planes"
-      when: bootstrap_status.rc == 0 and current_api_int_dns.stdout == bootstrap_ip.stdout
+        gcloud dns record-sets update "api-int.{{ domain_name }}." \
+          --zone={{ dns_zone }} --type=A --ttl=300 \
+          --rrdatas="{{ control_plane_ips | join(',') }}"
+        echo "✓ api-int DNS now points to control planes"
+      when: bootstrap_status.rc == 0 and apiserver_wait.rc == 0
+
+    - name: Remove bootstrap IP from api DNS
+      shell: |
+        gcloud dns record-sets update "api.{{ domain_name }}." \
+          --zone={{ dns_zone }} --type=A --ttl=300 \
+          --rrdatas="{{ control_plane_ips | join(',') }}"
+        echo "✓ api DNS now points to control planes only"
+      when: bootstrap_status.rc == 0 and apiserver_wait.rc == 0
 
     - name: Display bootstrap completion status
       debug:
         msg: |
           ✓ Bootstrap phase completed successfully!
           ✓ Control planes are ready
-          ✓ api-int DNS transitioned to control planes
-          
+          ✓ api-int and api DNS transitioned to control planes
+
           Next: Waiting for workers to join...
 
     # ================================
@@ -355,7 +382,7 @@
         echo "Waiting for worker CSRs to appear..."
 
         for i in {1..30}; do
-          PENDING_CSRS=$(kubectl get csr --no-headers 2>/dev/null | grep "Pending" | wc -l || echo "0")
+          PENDING_CSRS=$(oc get csr --no-headers 2>/dev/null | grep "Pending" | wc -l || echo "0")
           echo "  Pending CSRs: $PENDING_CSRS ($i/30)"
 
           if [ "$PENDING_CSRS" -ge "1" ]; then
@@ -374,10 +401,10 @@
         ssh -i {{ ssh_key_path }} -o StrictHostKeyChecking=no {{ bastion_user }}@{{ bastion_external_ip.stdout }} '
         export KUBECONFIG=~/clusterconfig/auth/kubeconfig
         echo "Approving all pending CSRs..."
-        PENDING=$(kubectl get csr --no-headers 2>/dev/null | grep "Pending" | awk "{print \$1}")
+        PENDING=$(oc get csr --no-headers 2>/dev/null | grep "Pending" | awk "{print \$1}")
         if [ -n "$PENDING" ]; then
           for csr in $PENDING; do
-            kubectl certificate approve $csr
+            oc certificate approve $csr
             echo "  ✓ Approved: $csr"
           done
         else
@@ -393,27 +420,27 @@
 
         for i in {1..30}; do
           # Approve any new pending CSRs (serving certs appear after initial approval)
-          PENDING=$(kubectl get csr --no-headers 2>/dev/null | grep "Pending" | awk "{print \$1}")
+          PENDING=$(oc get csr --no-headers 2>/dev/null | grep "Pending" | awk "{print \$1}")
           if [ -n "$PENDING" ]; then
             for csr in $PENDING; do
-              kubectl certificate approve $csr 2>/dev/null
+              oc certificate approve $csr 2>/dev/null
               echo "  ✓ Auto-approved CSR: $csr"
             done
           fi
 
-          READY_WORKERS=$(kubectl get nodes --no-headers 2>/dev/null | grep "worker" | grep " Ready " | wc -l || echo "0")
+          READY_WORKERS=$(oc get nodes --no-headers 2>/dev/null | grep "worker" | grep " Ready " | wc -l || echo "0")
           echo "  Ready workers: $READY_WORKERS/2 ($i/30)"
 
           if [ "$READY_WORKERS" -ge "2" ]; then
             echo "✓ All worker nodes are Ready"
-            kubectl get nodes
+            oc get nodes
             exit 0
           fi
           sleep 20
         done
 
         echo "⚠ Not all workers ready, but continuing"
-        kubectl get nodes || echo "No nodes found"
+        oc get nodes || echo "No nodes found"
         exit 0'
       register: worker_join_status
 
@@ -439,10 +466,10 @@
         create_secret() {
           local name=$1
           local ns=$2
-          if kubectl get secret "$name" -n "$ns" >/dev/null 2>&1; then
-            kubectl delete secret "$name" -n "$ns"
+          if oc get secret "$name" -n "$ns" >/dev/null 2>&1; then
+            oc delete secret "$name" -n "$ns"
           fi
-          kubectl create secret generic "$name" --from-file=service_account.json=<(echo "$SA_KEY") -n "$ns"
+          oc create secret generic "$name" --from-file=service_account.json=<(echo "$SA_KEY") -n "$ns"
           echo "  ✓ $ns/$name"
         }
 
@@ -466,8 +493,8 @@
         ssh -i {{ ssh_key_path }} -o StrictHostKeyChecking=no {{ bastion_user }}@{{ bastion_external_ip.stdout }} '
         export KUBECONFIG=~/clusterconfig/auth/kubeconfig
         echo "Removing uninitialized taints..."
-        for node in $(kubectl get nodes -o name); do
-          kubectl taint $node node.cloudprovider.kubernetes.io/uninitialized- 2>/dev/null && echo "  ✓ Untainted $node" || true
+        for node in $(oc get nodes -o name); do
+          oc adm taint $node node.cloudprovider.kubernetes.io/uninitialized- 2>/dev/null && echo "  ✓ Untainted $node" || true
         done
         echo "✓ All uninitialized taints removed"
         '
@@ -486,7 +513,7 @@
         export KUBECONFIG=~/clusterconfig/auth/kubeconfig
 
         echo "Enabling GCP Filestore CSI driver..."
-        cat <<EOF | kubectl apply -f -
+        cat <<EOF | oc apply -f -
         apiVersion: operator.openshift.io/v1
         kind: ClusterCSIDriver
         metadata:
@@ -496,7 +523,7 @@
         EOF
 
         echo "Creating Filestore StorageClass..."
-        cat <<EOF | kubectl apply -f -
+        cat <<EOF | oc apply -f -
         apiVersion: storage.k8s.io/v1
         kind: StorageClass
         metadata:
@@ -511,7 +538,7 @@
         EOF
 
         echo "✓ Filestore CSI driver enabled and StorageClass created"
-        kubectl get sc 2>&1
+        oc get sc 2>&1
         '
       register: filestore_setup
 
@@ -525,7 +552,7 @@
         export KUBECONFIG=~/clusterconfig/auth/kubeconfig
         echo "Waiting for ingress LoadBalancer to provision..."
         for i in {1..30}; do
-          LB_IP=$(kubectl get svc router-default -n openshift-ingress -o jsonpath="{.status.loadBalancer.ingress[0].ip}" 2>/dev/null)
+          LB_IP=$(oc get svc router-default -n openshift-ingress -o jsonpath="{.status.loadBalancer.ingress[0].ip}" 2>/dev/null)
           if [ -n "$LB_IP" ]; then
             echo "✓ Ingress LoadBalancer provisioned: $LB_IP"
             exit 0
@@ -546,10 +573,10 @@
         ssh -i {{ ssh_key_path }} -o StrictHostKeyChecking=no {{ bastion_user }}@{{ bastion_external_ip.stdout }} '
         export KUBECONFIG=~/clusterconfig/auth/kubeconfig
         echo "=== Final Cluster Status ==="
-        kubectl get nodes
+        oc get nodes
         echo ""
         echo "=== Cluster Operators Status ==="
-        kubectl get clusteroperators | head -10'
+        oc get clusteroperators | head -10'
       register: final_status
       ignore_errors: true
 
@@ -575,13 +602,13 @@
           
           🚀 Ready to Use:
           - Export kubeconfig: export KUBECONFIG=../clusterconfig/auth/kubeconfig
-          - Check cluster: kubectl get nodes
+          - Check cluster: oc get nodes
           - Access console: https://console-openshift-console.apps.{{ domain_name }}
           - Admin password: cat ../clusterconfig/auth/kubeadmin-password
           
           📋 Management Commands:
           - SSH to bastion: ssh -i {{ ssh_key_path }} {{ bastion_user }}@{{ bastion_external_ip.stdout }}
-          - Monitor operators: kubectl get clusteroperators
+          - Monitor operators: oc get clusteroperators
           - Destroy cluster: cd ../terraform && terraform destroy
 
 

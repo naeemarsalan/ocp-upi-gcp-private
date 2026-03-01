@@ -4,7 +4,7 @@ metadata:
   name: ocp
 platform:
   gcp:
-    projectID: your-gcp-project-id
+    projectID: openenv-vrmgr
     region: us-central1
 controlPlane:
   name: master

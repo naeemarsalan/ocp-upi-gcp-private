@@ -57,7 +57,7 @@ if ansible-playbook "$PLAYBOOK"; then
     echo ""
     log "🎉 Your OpenShift cluster is ready!"
     echo "   Export kubeconfig: export KUBECONFIG=clusterconfig/auth/kubeconfig"
-    echo "   Check cluster: kubectl get nodes"
+    echo "   Check cluster: oc get nodes"
 else
     echo "Deployment failed! Check the output above for details."
     exit 1

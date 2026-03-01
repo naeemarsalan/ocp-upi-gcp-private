@@ -13,8 +13,8 @@ These Terraform resources must exist before starting this guide. All are defined
 | VPC network | `google_compute_network.openshift_vpc` | Cluster networking |
 | Private subnets | `google_compute_subnetwork.openshift_subnets` | Node IP allocation |
 | Private DNS zone | `google_dns_managed_zone.cluster_zone` | `${cluster}-zone` — cluster DNS |
-| API DNS record | `google_dns_record_set.api` | `api.${domain}` → control plane IPs |
-| API-int DNS record | `google_dns_record_set.api_int` | `api-int.${domain}` → control plane IPs |
+| API DNS record | `google_dns_record_set.api` | `api.${domain}` → bootstrap + control plane IPs (bootstrap removed post-boot) |
+| API-int DNS record | `google_dns_record_set.api_int` | `api-int.${domain}` → bootstrap IP (flipped to control planes post-boot) |
 | Apps wildcard DNS | `google_dns_record_set.apps_wildcard` | `*.apps.${domain}` → worker IPs (updated in [Step 5](#step-5-update-apps-dns-to-loadbalancer-ip)) |
 | Node SA | `google_service_account.openshift_node_sa` | Attached to VM instances; CCM uses via instance metadata |
 | Operator SA | `google_service_account.openshift_operator_sa` | Key injected as secrets into operator namespaces |
@@ -84,15 +84,23 @@ ls -la creds/operator-sa-key.json
 
 If nodes are not Ready or the API is not responsive, you're still in the bootstrap phase — see [DEBUG_COMMANDS.md](DEBUG_COMMANDS.md).
 
+> **CSR Approval:** The playbook automatically approves worker CSRs during deployment. If deploying manually, approve pending CSRs with:
+> ```bash
+> oc get csr -o go-template='{{range .items}}{{if not .status}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' | xargs -r oc adm certificate approve
+> ```
+> Re-run until no pending CSRs remain (workers submit multiple rounds).
+
 ## Where You Are Now (MVP State)
 
 ### What Works
 
-After bootstrap completes and CSRs are approved:
-- 3 control-plane + 2 worker nodes are `Ready`
-- API server is accessible via `api-int` (already flipped from bootstrap to control planes)
+After bootstrap completes, DNS is flipped, and CSRs are approved:
+- 3 control-plane + 2 worker nodes are `Ready` (but may have CCM uninitialized taint — see Step 2)
+- API server is accessible via `api` and `api-int` (both now point to control planes, bootstrap IP removed)
 - etcd is running and healthy
-- Core Kubernetes workloads schedule and run
+- Core Kubernetes workloads schedule (once taints are removed)
+
+> **Note:** The `./deploy.sh` playbook handles the DNS transition (api-int flip from bootstrap → control planes, bootstrap IP removal from api) and CSR approval automatically. If deploying manually, see [the playbook](../ansible/openshift-upi-basic.yml) for the correct sequencing — the DNS flip must wait until kube-apiserver is running on ≥2 control planes to avoid losing API connectivity.
 
 ### What Doesn't Work (The Gaps)
 
@@ -171,9 +179,11 @@ The `platform: gcp` setting causes kubelet to taint every node as `uninitialized
 
 ```bash
 for node in $(oc get nodes -o name); do
-  oc taint $node node.cloudprovider.kubernetes.io/uninitialized- 2>/dev/null || true
+  oc adm taint $node node.cloudprovider.kubernetes.io/uninitialized- 2>/dev/null || true
 done
 ```
+
+> **Note:** Workers also receive this taint when they join the cluster. If you run this step before workers are Ready, re-run it after approving worker CSRs (the `for node` loop is idempotent — already-untainted nodes are silently skipped).
 
 **Verify:**
 
@@ -448,9 +458,9 @@ echo "(empty = all operators healthy)"
 ### Expected Final State
 
 - **Nodes**: 3 control-plane + 2 workers, all `Ready`
-- **Cluster Operators**: all `Available=True`, `Progressing=False`, `Degraded=False` (except `control-plane-machine-set` which is `Degraded` — expected for UPI)
+- **Cluster Operators**: all `Available=True`, `Progressing=False`, `Degraded=False` (except `control-plane-machine-set`, `machine-api`, and `cluster-autoscaler` which are `Degraded` — expected for UPI)
 - **Cluster Version**: `Available=True`
-- **Storage Classes**: `standard-csi`, `premium-rwo` (PD CSI), `filestore-rwx` (Filestore CSI)
+- **Storage Classes**: `standard-csi` (default), `ssd-csi` (PD CSI), `filestore-rwx` (Filestore CSI)
 - **Ingress**: `router-default` has a public `EXTERNAL-IP`
 - **Console**: accessible at `https://console-openshift-console.apps.${DOMAIN}`
 - **DNS**: `*.apps` points to the LoadBalancer IP

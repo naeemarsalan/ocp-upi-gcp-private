@@ -339,7 +339,10 @@ resource "google_dns_record_set" "api" {
 
   managed_zone = google_dns_managed_zone.cluster_zone.name
 
+  # Includes bootstrap IP initially - kubeconfig uses api.${domain} which needs bootstrap during boot
+  # Automation removes bootstrap IP after control plane kube-apiservers are running
   rrdatas = [
+    google_compute_instance.bootstrap.network_interface[0].network_ip,
     google_compute_instance.control_plane[0].network_interface[0].network_ip,
     google_compute_instance.control_plane[1].network_interface[0].network_ip,
     google_compute_instance.control_plane[2].network_interface[0].network_ip
