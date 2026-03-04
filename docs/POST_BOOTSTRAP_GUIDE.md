@@ -2,6 +2,36 @@
 
 Operational runbook for taking an OpenShift UPI cluster from "bootstrap complete, nodes Ready" to fully functional with working GCP integrations. For the *why* behind each component, see [GCP_PLATFORM_INTEGRATION.md](GCP_PLATFORM_INTEGRATION.md).
 
+## Pre-Deployment: Installer Credential Requirements
+
+When running `openshift-install create manifests` with `platform: gcp`, the installer **validates the GCP project and region** even with `credentialsMode: Manual`. It will prompt for a service account key path if no credentials are found.
+
+### How to Provide Credentials (pick one)
+
+| Method | Command | Notes |
+|--------|---------|-------|
+| Application Default Credentials (recommended) | `gcloud auth application-default login` | Uses your user identity; no SA key file needed |
+| Environment variable | `export GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa-key.json` | Installer reads this automatically |
+| Prompt response | Enter the path when prompted | Works but less automatable |
+
+### Minimum SA Permissions (Tested on 4.19.24)
+
+If using a dedicated service account (not your user identity), it needs only **5 permissions** for manifest and ignition generation:
+
+| Permission | Why |
+|---|---|
+| `resourcemanager.projects.get` | Validate GCP project exists |
+| `compute.regions.list` | Validate the configured region |
+| `compute.zones.list` | Enumerate availability zones |
+| `compute.machineTypes.list` | Validate default machine type (`n2-standard-4`) |
+| `dns.managedZones.list` | Find the DNS zone for the base domain |
+
+Equivalent predefined roles: `roles/compute.viewer` + `roles/dns.reader` + `roles/browser`.
+
+> **Important:** These are the *installer* credentials — used only during `create manifests` / `create ignition-configs`. They are **not** the operator credentials injected in [Step 1](#step-1-inject-gcp-credential-secrets). The installer does not bake these credentials into the cluster when `credentialsMode: Manual` is set.
+
+---
+
 ## Prerequisites
 
 ### Terraform Infrastructure (Must Be Complete)
