@@ -73,6 +73,81 @@
         mode: '0644'
       tags: [ignition]
 
+    - name: Generate OpenShift manifests
+      command: openshift-install create manifests --dir=../clusterconfig
+      register: manifests_result
+      tags: [ignition]
+
+    # ================================
+    # 2b. Workload Identity Federation (ccoctl)
+    # ================================
+
+    - name: Ensure ccoctl is installed
+      shell: |
+        if ! command -v ccoctl >/dev/null 2>&1; then
+          echo "Extracting ccoctl from release image..."
+          oc adm release extract \
+            --command=ccoctl \
+            quay.io/openshift-release-dev/ocp-release:4.19.0-x86_64 \
+            -a {{ pull_secret_path }} \
+            --to=/usr/local/bin/
+          echo "ccoctl installed"
+        else
+          echo "ccoctl already installed"
+        fi
+      tags: [ignition, wif]
+
+    - name: Create credrequests directory
+      file:
+        path: "../credrequests"
+        state: directory
+        mode: '0755'
+      tags: [ignition, wif]
+
+    - name: Extract CredentialsRequests from release image
+      shell: |
+        oc adm release extract \
+          --credentials-requests \
+          --cloud=gcp \
+          --to=../credrequests \
+          quay.io/openshift-release-dev/ocp-release:4.19.0-x86_64 \
+          -a {{ pull_secret_path }}
+      tags: [ignition, wif]
+
+    - name: Create ccoctl output directory
+      file:
+        path: "../ccoctl-output"
+        state: directory
+        mode: '0755'
+      tags: [ignition, wif]
+
+    - name: Run ccoctl to create WIF resources and credential configs
+      shell: |
+        ccoctl gcp create-all \
+          --name={{ cluster_name }}-cluster \
+          --region={{ region }} \
+          --project={{ gcp_project_id }} \
+          --credentials-requests-dir=../credrequests \
+          --output-dir=../ccoctl-output
+      tags: [ignition, wif]
+
+    - name: Copy ccoctl manifests into clusterconfig
+      shell: |
+        cp ../ccoctl-output/manifests/* ../clusterconfig/manifests/
+      tags: [ignition, wif]
+
+    - name: Copy ccoctl TLS material into clusterconfig
+      shell: |
+        cp -r ../ccoctl-output/tls ../clusterconfig/tls
+      tags: [ignition, wif]
+
+    - name: Verify Authentication resource issuer is set
+      shell: |
+        grep -l 'serviceAccountIssuer' ../clusterconfig/manifests/ 2>/dev/null || echo "Warning: no serviceAccountIssuer manifest found"
+      register: issuer_check
+      changed_when: false
+      tags: [ignition, wif]
+
     - name: Generate OpenShift ignition configs
       command: openshift-install create ignition-configs --dir=../clusterconfig
       register: ignition_result
@@ -91,7 +166,7 @@
 
     - name: Display ignition generation status
       debug:
-        msg: "✓ OpenShift ignition configs generated successfully"
+        msg: "✓ OpenShift ignition configs generated with WIF credentials"
       tags: [ignition]
 
     # ================================
@@ -445,44 +520,13 @@
       register: worker_join_status
 
     # ================================
-    # 8. GCP Credential Injection (platform: gcp + credentialsMode: Manual)
+    # 8. Bastion Setup
     # ================================
 
     - name: Copy SSH private key to bastion for node access
       shell: |
         scp -i {{ ssh_key_path }} -o StrictHostKeyChecking=no {{ ssh_key_path }} {{ bastion_user }}@{{ bastion_external_ip.stdout }}:~/.ssh/id_rsa
         ssh -i {{ ssh_key_path }} -o StrictHostKeyChecking=no {{ bastion_user }}@{{ bastion_external_ip.stdout }} 'chmod 600 ~/.ssh/id_rsa'
-
-    - name: Copy operator SA key to bastion
-      shell: |
-        scp -i {{ ssh_key_path }} -o StrictHostKeyChecking=no {{ operator_sa_key_path }} {{ bastion_user }}@{{ bastion_external_ip.stdout }}:~/operator-sa-key.json
-
-    - name: Inject GCP credential secrets for all operators
-      shell: |
-        ssh -i {{ ssh_key_path }} -o StrictHostKeyChecking=no {{ bastion_user }}@{{ bastion_external_ip.stdout }} '
-        export KUBECONFIG=~/clusterconfig/auth/kubeconfig
-        SA_KEY=$(cat ~/operator-sa-key.json)
-
-        create_secret() {
-          local name=$1
-          local ns=$2
-          if oc get secret "$name" -n "$ns" >/dev/null 2>&1; then
-            oc delete secret "$name" -n "$ns"
-          fi
-          oc create secret generic "$name" --from-file=service_account.json=<(echo "$SA_KEY") -n "$ns"
-          echo "  ✓ $ns/$name"
-        }
-
-        echo "Creating GCP credential secrets..."
-        create_secret gcp-pd-cloud-credentials openshift-cluster-csi-drivers
-        create_secret gcp-ccm-cloud-credentials openshift-cloud-controller-manager
-        create_secret cloud-credential-operator-gcp-ro-creds openshift-cloud-credential-operator
-        create_secret cloud-credentials openshift-cloud-network-config-controller
-        create_secret installer-cloud-credentials openshift-image-registry
-        create_secret cloud-credentials openshift-ingress-operator
-        create_secret gcp-cloud-credentials openshift-machine-api
-        echo "✓ All GCP credential secrets created"
-        '
 
     # ================================
     # 9. Remove cloud-provider uninitialized taint

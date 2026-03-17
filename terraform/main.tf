@@ -509,15 +509,23 @@ resource "google_compute_firewall" "allow_bastion_ssh" {
 }
 
 # ========================================
-# OpenShift Operator Service Account
-# Used by cluster operators (CSI, CCM, Ingress, Machine API, Image Registry)
-# with credentialsMode: Manual
+# GCP APIs and IAM for Workload Identity Federation (WIF)
+# Operator credentials are managed by ccoctl (CCO utility) which creates
+# per-operator GCP service accounts with WIF trust bindings.
+# The custom role below is bound to the node SA for CCM metadata auth.
 # ========================================
 
-resource "google_service_account" "openshift_operator_sa" {
-  account_id   = "${var.cluster_name}-operator-sa"
-  display_name = "OpenShift Operator Service Account"
-  description  = "Service account for OpenShift cluster operators (CSI, CCM, Ingress, Registry, Machine API)"
+# Enable APIs required for Workload Identity Federation (WIF)
+resource "google_project_service" "iam_credentials_api" {
+  service = "iamcredentials.googleapis.com"
+}
+
+resource "google_project_service" "iam_api" {
+  service = "iam.googleapis.com"
+}
+
+resource "google_project_service" "sts_api" {
+  service = "sts.googleapis.com"
 }
 
 # Custom IAM role with granular permissions for all OpenShift operators
@@ -650,31 +658,12 @@ resource "google_project_iam_custom_role" "openshift_operator_role" {
   ]
 }
 
-# Bind the custom role to the operator service account
-resource "google_project_iam_member" "openshift_operator_role_binding" {
-  project = var.project_id
-  role    = google_project_iam_custom_role.openshift_operator_role.id
-  member  = "serviceAccount:${google_service_account.openshift_operator_sa.email}"
-}
-
-# Bind the custom role to the node service account as well
-# The GCE CCM uses instance metadata credentials (node SA) for LB operations
+# Bind the custom role to the node service account
+# The GCE CCM uses instance metadata credentials (node SA) for LB/cloud operations
 resource "google_project_iam_member" "openshift_node_operator_role_binding" {
   project = var.project_id
   role    = google_project_iam_custom_role.openshift_operator_role.id
   member  = "serviceAccount:${google_service_account.openshift_node_sa.email}"
-}
-
-# Generate a service account key for the operator SA
-resource "google_service_account_key" "openshift_operator_key" {
-  service_account_id = google_service_account.openshift_operator_sa.name
-}
-
-# Write the key to a local file for Ansible to inject into the cluster
-resource "local_file" "openshift_operator_sa_key" {
-  content         = base64decode(google_service_account_key.openshift_operator_key.private_key)
-  filename        = "${path.module}/../creds/operator-sa-key.json"
-  file_permission = "0600"
 }
 
 # Allow GCP health check probes (required for LoadBalancer services)

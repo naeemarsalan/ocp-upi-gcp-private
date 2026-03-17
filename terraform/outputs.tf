@@ -103,17 +103,6 @@ output "worker_ips" {
   value       = [for instance in google_compute_instance.worker : instance.network_interface[0].network_ip]
 }
 
-# OpenShift Operator Service Account
-output "operator_service_account_email" {
-  description = "Email of the OpenShift operator service account"
-  value       = google_service_account.openshift_operator_sa.email
-}
-
-output "operator_sa_key_path" {
-  description = "Path to the operator service account key file"
-  value       = local_file.openshift_operator_sa_key.filename
-}
-
 # Bastion Host
 output "bastion_external_ip" {
   description = "External IP of the bastion host"
