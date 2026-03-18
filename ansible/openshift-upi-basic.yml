@@ -8,6 +8,7 @@
   tasks:
     # ================================
     # 1. Prerequisites Validation
+    # Requires: deployer SA with 10 roles (see docs/GCP_PERMISSIONS.md)
     # ================================
     
     - name: Verify required tools are installed
@@ -26,6 +27,17 @@
       register: gcloud_auth
       failed_when: gcloud_auth.stdout == ""
       changed_when: false
+      tags: [prerequisites]
+
+    - name: Verify WIF-required APIs are enabled
+      shell: "gcloud services list --enabled --filter='name:{{ item }}' --format='value(name)'"
+      register: api_check
+      failed_when: api_check.stdout == ""
+      changed_when: false
+      loop:
+        - iam.googleapis.com
+        - iamcredentials.googleapis.com
+        - sts.googleapis.com
       tags: [prerequisites]
 
     - name: Verify SSH key exists
@@ -80,6 +92,9 @@
 
     # ================================
     # 2b. Workload Identity Federation (ccoctl)
+    # Requires: iam.workloadIdentityPoolAdmin, iam.serviceAccountAdmin,
+    #           iam.roleAdmin, resourcemanager.projectIamAdmin, storage.admin
+    # See docs/WIF_IMPLEMENTATION.md for details
     # ================================
 
     - name: Ensure ccoctl is installed

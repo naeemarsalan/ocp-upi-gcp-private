@@ -46,6 +46,10 @@ Key differences from old approach:
 
 ## Prerequisites
 
+### GCP Permissions
+
+The deployer SA needs 10 specific IAM roles (not `roles/owner`). See [GCP_PERMISSIONS.md](GCP_PERMISSIONS.md) for the complete step-by-step setup including the minimal custom role alternative.
+
 ### Required GCP APIs
 
 These must be enabled before running `ccoctl`:

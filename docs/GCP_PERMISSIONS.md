@@ -1,443 +1,418 @@
-# GCP Permissions for OpenShift UPI Deployment
+# GCP Permissions for OpenShift 4.19 UPI with Workload Identity Federation
 
-This document outlines the required GCP permissions and IAM roles for deploying OpenShift 4.19 UPI (User Provisioned Infrastructure) on Google Cloud Platform.
+Minimal IAM permissions for deploying OpenShift 4.19 UPI on GCP using Workload Identity Federation (WIF). No long-lived service account keys are created.
 
-**Key Distinction: UPI deployment requires broader infrastructure permissions, while OpenShift cluster operations need limited, specific permissions for ongoing functionality.**
+## Two Service Accounts, Two Purposes
 
-## Table of Contents
+| Service Account | When | Purpose | Lifetime |
+|----------------|------|---------|----------|
+| **Deployer SA** | During deployment | Runs Terraform, ccoctl, openshift-install, Ansible | Temporary - remove after deploy |
+| **Node SA** | Cluster runtime | Attached to VMs, used by CCM for metadata auth | Permanent - lives with cluster |
 
-- [Overview: UPI vs OpenShift Permissions](#overview-upi-vs-openshift-permissions)
-- [Prerequisites](#prerequisites)
-- [Phase 1: UPI Deployment Permissions](#phase-1-upi-deployment-permissions)
-- [Phase 2: OpenShift Cluster Operations](#phase-2-openshift-cluster-operations)
-- [Service Account Setup](#service-account-setup)
-- [Required API Services](#required-api-services)
-- [Security Best Practices](#security-best-practices)
-- [Troubleshooting Permission Issues](#troubleshooting-permission-issues)
-
-## Overview: UPI vs OpenShift Permissions
-
-### UPI Deployment Phase (Temporary Broad Access)
-**Purpose**: Create infrastructure (VMs, networks, DNS, storage)
-**Duration**: Only during initial deployment
-**Permissions**: Broad administrative access to create resources
-**Scope**: Project-level permissions for infrastructure provisioning
-
-### OpenShift Operations Phase (Limited Ongoing Access)
-**Purpose**: Cluster functionality (storage, networking, monitoring)
-**Duration**: Ongoing cluster operations
-**Permissions**: Minimal required permissions for specific operations
-**Scope**: Resource-specific permissions following least-privilege principle
+The deployer SA creates everything. The node SA is what the running cluster uses. ccoctl creates additional per-operator SAs automatically (you don't manage these).
 
 ---
 
-## Prerequisites
+## Step-by-Step Manual Setup
 
-Before starting, ensure you have:
+### Step 1: Enable Required APIs
 
-- A GCP project with billing enabled
-- gcloud CLI installed and configured
-- Appropriate permissions to create IAM roles and service accounts
-
-## Phase 1: UPI Deployment Permissions
-
-### User Account for UPI Deployment
-
-**IMPORTANT**: These permissions are needed ONLY during UPI deployment phase.
-
-#### Option A: Owner Role (Simplest)
-```bash
-roles/owner    # Full project access - easiest but broadest
-```
-
-#### Option B: Minimal UPI Deployment Roles (Recommended)
-```bash
-# Infrastructure Management
-roles/compute.admin                   # Create VMs, networks, disks, firewalls
-roles/dns.admin                      # Create DNS zones and records
-roles/storage.admin                  # Create GCS buckets for ignition files
-
-# IAM Management  
-roles/iam.serviceAccountAdmin        # Create service accounts
-roles/iam.serviceAccountKeyAdmin     # Create service account keys
-roles/resourcemanager.projectIamAdmin # Assign IAM policies
-
-# API Management
-roles/serviceusage.serviceUsageAdmin  # Enable required APIs
-```
-
-#### UPI Deployment Scope
-These permissions are used for:
-- Creating compute instances (bootstrap, control planes, workers, bastion)
-- Setting up networking (VPC, subnets, firewall rules)
-- Configuring DNS (private zones, A records)
-- Creating storage (GCS buckets for ignition files)
-- Setting up service accounts for ongoing operations
-
-### Verify User Permissions
-
-```bash
-# Check current user permissions
-gcloud auth list
-gcloud config get-value project
-
-# Test permissions
-gcloud iam roles list --filter="name:roles/owner" --limit=1
-gcloud services list --enabled
-```
-
-## Service Account Setup
-
-### 1. Create Terraform Service Account
-
-```bash
-# Create service account for Terraform
-gcloud iam service-accounts create openshift-terraform \
-    --display-name="OpenShift Terraform Service Account" \
-    --description="Service account for Terraform OpenShift UPI deployment"
-```
-
-### 2. Create OpenShift Node Service Account
-
-```bash
-# Create service account for OpenShift nodes
-gcloud iam service-accounts create ocp-node-sa \
-    --display-name="OpenShift Node Service Account" \
-    --description="Service account for OpenShift cluster nodes"
-```
-
-## Required API Services
-
-Enable the following APIs in your GCP project:
-
-```bash
-# Enable required APIs
-gcloud services enable compute.googleapis.com
-gcloud services enable dns.googleapis.com
-gcloud services enable storage.googleapis.com
-gcloud services enable iam.googleapis.com
-gcloud services enable iamcredentials.googleapis.com
-gcloud services enable serviceusage.googleapis.com
-gcloud services enable cloudresourcemanager.googleapis.com
-
-# Verify APIs are enabled
-gcloud services list --enabled --filter="name:(compute.googleapis.com OR dns.googleapis.com OR storage.googleapis.com)"
-```
-
-### Terraform Service Account (UPI Deployment Only)
-
-**TEMPORARY**: These permissions are only needed during UPI infrastructure deployment.
-
-### Terraform Infrastructure Roles
+These must be enabled before anything else. You need an account with `roles/serviceusage.serviceUsageAdmin` or `roles/owner` to do this.
 
 ```bash
 PROJECT_ID=$(gcloud config get-value project)
-TERRAFORM_SA="openshift-terraform@${PROJECT_ID}.iam.gserviceaccount.com"
 
-# UPI DEPLOYMENT ONLY: Infrastructure creation
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:${TERRAFORM_SA}" \
-    --role="roles/compute.admin"
-
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:${TERRAFORM_SA}" \
-    --role="roles/dns.admin"
-
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:${TERRAFORM_SA}" \
-    --role="roles/storage.admin"
-
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:${TERRAFORM_SA}" \
-    --role="roles/iam.serviceAccountUser"
+gcloud services enable compute.googleapis.com       # VMs, networks, firewalls
+gcloud services enable dns.googleapis.com            # DNS zones and records
+gcloud services enable storage.googleapis.com        # GCS buckets (ignition, OIDC)
+gcloud services enable iam.googleapis.com            # Service accounts, custom roles
+gcloud services enable iamcredentials.googleapis.com # WIF token exchange
+gcloud services enable sts.googleapis.com            # WIF Security Token Service
+gcloud services enable cloudresourcemanager.googleapis.com # Project metadata
 ```
 
-### UPI Infrastructure Permissions Breakdown
+> Terraform also enables `iam`, `iamcredentials`, and `sts` APIs via `google_project_service` resources, but they must be enabled before ccoctl runs. If you run ccoctl before Terraform (as the playbook does), enable them manually first.
 
-| Phase | Resource | Permission Level | Purpose | Duration |
-|-------|----------|------------------|---------|----------|
-| **UPI** | **Compute Engine** | `compute.admin` | Create VMs, networks, firewalls, disks | Deployment only |
-| **UPI** | **Cloud DNS** | `dns.admin` | Create private DNS zones and records | Deployment only |
-| **UPI** | **Cloud Storage** | `storage.admin` | Create buckets for ignition files | Deployment only |
-| **UPI** | **IAM** | `iam.serviceAccountUser` | Assign service accounts to resources | Deployment only |
-| **OpenShift** | **Compute Engine** | `compute.viewer` | Read instance metadata, disk info | Ongoing |
-| **OpenShift** | **Cloud Storage** | `storage.objectViewer` | Pull container images | Ongoing |
-
-## Phase 2: OpenShift Cluster Operations
-
-### OpenShift Node Service Account (Ongoing Operations)
-
-**IMPORTANT**: These are the minimal permissions needed for ongoing OpenShift cluster operations.
-
-### Required Roles for OpenShift Operations
+### Step 2: Create the Deployer Service Account
 
 ```bash
-PROJECT_ID=$(gcloud config get-value project)
-NODE_SA="ocp-node-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+gcloud iam service-accounts create ocp-deployer \
+  --display-name="OpenShift UPI Deployer" \
+  --description="Temporary SA for deploying OpenShift UPI infrastructure and WIF"
+```
 
-# MINIMAL REQUIRED: Compute operations
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:${NODE_SA}" \
-    --role="roles/compute.viewer"
+### Step 3: Grant Minimal Roles to the Deployer SA
 
-# MINIMAL REQUIRED: Container image access
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:${NODE_SA}" \
-    --role="roles/storage.objectViewer"
+```bash
+DEPLOYER_SA="ocp-deployer@${PROJECT_ID}.iam.gserviceaccount.com"
 
-# RECOMMENDED: Monitoring and logging (for cluster observability)
+# --- Infrastructure (Terraform) ---
 gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:${NODE_SA}" \
-    --role="roles/monitoring.metricWriter"
+  --member="serviceAccount:${DEPLOYER_SA}" \
+  --role="roles/compute.admin"
+  # Creates: VMs, VPC, subnets, firewalls, Cloud Router, Cloud NAT, images
 
 gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:${NODE_SA}" \
-    --role="roles/logging.logWriter"
-```
+  --member="serviceAccount:${DEPLOYER_SA}" \
+  --role="roles/dns.admin"
+  # Creates: private DNS zone, A records for api/api-int/apps
 
-### OpenShift Operations Scope
-These permissions enable:
-- **Compute metadata access** - Node discovery and instance information
-- **Container registry access** - Pull container images
-- **Persistent disk operations** - Dynamic volume provisioning (CSI)
-- **Load balancer integration** - Service load balancer creation
-- **Monitoring data export** - Cluster metrics to GCP Monitoring
-- **Log aggregation** - Cluster logs to GCP Logging
-
-### What OpenShift DOES NOT Need
-- **Compute admin** - Cannot create/delete VMs
-- **Network admin** - Cannot modify VPC/subnets
-- **DNS admin** - Cannot change DNS records
-- **IAM admin** - Cannot modify service accounts
-- **Storage admin** - Cannot create/delete buckets
-
-### Bootstrap-Specific Permissions
-
-For the bootstrap node to access ignition files:
-
-```bash
-# Grant bootstrap bucket access
-BOOTSTRAP_BUCKET="ocp-bootstrap-ignition-$(openssl rand -hex 4)"
-
-# Create bucket IAM binding (handled by Terraform, shown for reference)
-gcloud storage buckets add-iam-policy-binding gs://${BOOTSTRAP_BUCKET} \
-    --member="serviceAccount:${NODE_SA}" \
-    --role="roles/storage.legacyBucketReader"
-
-# Allow public read access to bootstrap.ign (if needed)
-gcloud storage buckets add-iam-policy-binding gs://${BOOTSTRAP_BUCKET} \
-    --member="allUsers" \
-    --role="roles/storage.objectViewer"
-```
-
-## Security Best Practices
-
-### 1. Two-Phase Permission Strategy
-
-**Phase 1 - UPI Deployment (Temporary Elevated Access)**
-```bash
-# Use elevated permissions ONLY during deployment
-# Remove or reduce permissions after infrastructure is created
-```
-
-**Phase 2 - OpenShift Operations (Minimal Ongoing Access)**
-```bash
-# Use minimal permissions for ongoing cluster operations
-# Follow least-privilege principle for production
-```
-
-### 2. Principle of Least Privilege
-
-- **UPI Phase**: Use broad permissions temporarily for infrastructure creation
-- **Operations Phase**: Immediately reduce to minimal required permissions
-- **Regular Audits**: Remove unused permissions quarterly
-- **Custom Roles**: Create specific roles instead of using broad predefined ones
-
-### 2. Service Account Key Management
-
-```bash
-# Create and download service account key securely
-gcloud iam service-accounts keys create terraform-sa-key.json \
-    --iam-account="${TERRAFORM_SA}"
-
-# Set restrictive permissions on the key file
-chmod 600 terraform-sa-key.json
-
-# Use environment variable instead of storing in Terraform files
-export GOOGLE_APPLICATION_CREDENTIALS="$(pwd)/terraform-sa-key.json"
-```
-
-### 3. Post-Deployment Permission Cleanup
-
-**CRITICAL**: Remove elevated UPI permissions after deployment:
-
-```bash
-# After successful deployment, remove broad Terraform permissions
-gcloud projects remove-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:openshift-terraform@${PROJECT_ID}.iam.gserviceaccount.com" \
-    --role="roles/compute.admin"
-
-gcloud projects remove-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:openshift-terraform@${PROJECT_ID}.iam.gserviceaccount.com" \
-    --role="roles/dns.admin"
-
-gcloud projects remove-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:openshift-terraform@${PROJECT_ID}.iam.gserviceaccount.com" \
-    --role="roles/storage.admin"
-
-# Keep only minimal ongoing permissions for OpenShift operations
-# (The node service account retains compute.viewer, storage.objectViewer, etc.)
-```
-
-### 4. Temporary Deployment Permissions
-
-For one-time deployments, use time-bound elevated permissions:
-
-```bash
-# Grant temporary admin access with expiration
 gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="user:your-email@domain.com" \
-    --role="roles/owner" \
-    --condition='expression=request.time < timestamp("2025-12-31T23:59:59Z"),title=Temporary OpenShift UPI Deployment'
+  --member="serviceAccount:${DEPLOYER_SA}" \
+  --role="roles/storage.admin"
+  # Creates: bootstrap ignition GCS bucket, OIDC discovery bucket (via ccoctl)
+
+# --- IAM (Terraform + ccoctl) ---
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:${DEPLOYER_SA}" \
+  --role="roles/iam.serviceAccountAdmin"
+  # Creates: node SA (Terraform), per-operator SAs (ccoctl)
+
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:${DEPLOYER_SA}" \
+  --role="roles/iam.serviceAccountUser"
+  # Attaches: node SA to VM instances
+
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:${DEPLOYER_SA}" \
+  --role="roles/iam.roleAdmin"
+  # Creates: custom IAM roles for operators (Terraform + ccoctl)
+
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:${DEPLOYER_SA}" \
+  --role="roles/iam.workloadIdentityPoolAdmin"
+  # Creates: WIF pool and OIDC provider (ccoctl)
+
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:${DEPLOYER_SA}" \
+  --role="roles/resourcemanager.projectIamAdmin"
+  # Binds: IAM policies to SAs (both Terraform and ccoctl)
+
+# --- API management ---
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:${DEPLOYER_SA}" \
+  --role="roles/serviceusage.serviceUsageAdmin"
+  # Enables: iam, iamcredentials, sts APIs via Terraform
+
+# --- Project metadata (openshift-install needs this) ---
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:${DEPLOYER_SA}" \
+  --role="roles/browser"
+  # Reads: project metadata (resourcemanager.projects.get)
 ```
 
-### 4. Resource-Specific Permissions
+**Total: 10 predefined roles.** No `roles/owner`. No `roles/iam.serviceAccountKeyAdmin` (no keys needed with WIF).
 
-Instead of project-wide permissions, consider resource-specific bindings:
+### Step 4: Activate the Deployer SA
 
 ```bash
-# Example: Bucket-specific permissions
-gcloud storage buckets add-iam-policy-binding gs://my-bucket \
-    --member="serviceAccount:${NODE_SA}" \
-    --role="roles/storage.objectViewer"
+# Generate a key for local use (this is the ONLY key in the entire workflow)
+gcloud iam service-accounts keys create deployer-key.json \
+  --iam-account="${DEPLOYER_SA}"
+
+chmod 600 deployer-key.json
+
+# Activate for gcloud CLI
+gcloud auth activate-service-account --key-file=deployer-key.json
+
+# Set for Terraform and openshift-install
+export GOOGLE_APPLICATION_CREDENTIALS="$(pwd)/deployer-key.json"
 ```
 
-## Troubleshooting Permission Issues
+### Step 5: Run the Deployment
 
-### Common Permission Errors
+From here, follow the deployment flow. Each tool uses the deployer SA credentials:
 
-#### 1. "Permission denied" during Terraform apply
-
+**5a. Generate manifests** (openshift-install uses `GOOGLE_APPLICATION_CREDENTIALS`)
 ```bash
-# Check if APIs are enabled
-gcloud services list --enabled | grep -E "(compute|dns|storage)"
-
-# Verify service account permissions
-gcloud projects get-iam-policy $PROJECT_ID \
-    --flatten="bindings[].members" \
-    --filter="bindings.members:serviceAccount:openshift-terraform*"
+openshift-install create manifests --dir=./clusterconfig
 ```
+> Uses: `roles/browser` + `roles/compute.admin` (reads zones, machine types, DNS zones)
 
-#### 2. Bootstrap ignition fetch fails (403 Forbidden)
-
+**5b. Extract ccoctl and CredentialsRequests**
 ```bash
-# Check bucket permissions
-gsutil iam get gs://your-bootstrap-bucket
+oc adm release extract --command=ccoctl \
+  quay.io/openshift-release-dev/ocp-release:4.19.0-x86_64 \
+  -a ./pull --to=/usr/local/bin/
 
-# Verify service account has bucket access
-gcloud storage buckets get-iam-policy gs://your-bootstrap-bucket
+oc adm release extract --credentials-requests --cloud=gcp \
+  --to=./credrequests \
+  quay.io/openshift-release-dev/ocp-release:4.19.0-x86_64 \
+  -a ./pull
 ```
+> No GCP permissions needed - pulls from container registry only.
 
-#### 3. Nodes can't join cluster
-
+**5c. Run ccoctl** (uses gcloud CLI credentials or ADC)
 ```bash
-# Check node service account permissions
-gcloud projects get-iam-policy $PROJECT_ID \
-    --flatten="bindings[].members" \
-    --filter="bindings.members:serviceAccount:ocp-node-sa*"
-
-# Verify compute permissions
-gcloud compute instances list --filter="name~'ocp-.*'"
+ccoctl gcp create-all \
+  --name=<cluster_name>-cluster \
+  --region=<region> \
+  --project=<project_id> \
+  --credentials-requests-dir=./credrequests \
+  --output-dir=./ccoctl-output
 ```
+> Uses: `roles/iam.workloadIdentityPoolAdmin` + `roles/iam.serviceAccountAdmin` + `roles/iam.roleAdmin` + `roles/resourcemanager.projectIamAdmin` + `roles/storage.admin`
 
-### Debug Commands
-
+**5d. Copy ccoctl output and generate ignition**
 ```bash
-# Test Terraform service account permissions
-gcloud auth activate-service-account --key-file=terraform-sa-key.json
-gcloud compute zones list --limit=1  # Test compute access
-gcloud dns managed-zones list --limit=1  # Test DNS access
-gcloud storage buckets list --limit=1  # Test storage access
-
-# Check quota and limits
-gcloud compute project-info describe --format="table(quotas.metric,quotas.limit,quotas.usage)"
-
-# Validate APIs
-gcloud services list --available --filter="name:(compute.googleapis.com OR dns.googleapis.com)" --format="table(name,title)"
+cp ./ccoctl-output/manifests/* ./clusterconfig/manifests/
+cp -r ./ccoctl-output/tls ./clusterconfig/tls
+openshift-install create ignition-configs --dir=./clusterconfig
 ```
+> No GCP permissions needed - local file operations only.
 
-### Permission Validation Script
+**5e. Apply Terraform**
+```bash
+cd terraform && terraform init && terraform apply
+```
+> Uses: `roles/compute.admin` + `roles/dns.admin` + `roles/storage.admin` + `roles/iam.serviceAccountAdmin` + `roles/iam.serviceAccountUser` + `roles/iam.roleAdmin` + `roles/resourcemanager.projectIamAdmin` + `roles/serviceusage.serviceUsageAdmin`
+
+**5f. Post-bootstrap (Ansible gcloud commands)**
+```bash
+# DNS record updates (api-int flip, api cleanup)
+gcloud dns record-sets update ...
+# Instance metadata queries
+gcloud compute instances describe ...
+```
+> Uses: `roles/dns.admin` + `roles/compute.admin`
+
+> **Automation**: The full playbook at `ansible/openshift-upi-basic.yml` automates steps 5a-5f. See `docs/WIF_IMPLEMENTATION.md` for the ccoctl workflow details.
+
+### Step 6: Post-Deploy Cleanup
+
+After the cluster is running, remove the deployer SA's elevated permissions:
 
 ```bash
-#!/bin/bash
-# validate-permissions.sh
-
-PROJECT_ID=$(gcloud config get-value project)
-TERRAFORM_SA="openshift-terraform@${PROJECT_ID}.iam.gserviceaccount.com"
-NODE_SA="ocp-node-sa@${PROJECT_ID}.iam.gserviceaccount.com"
-
-echo "Validating GCP permissions for OpenShift UPI deployment..."
-
-# Check APIs
-echo "Checking required APIs..."
-for api in compute.googleapis.com dns.googleapis.com storage.googleapis.com iam.googleapis.com; do
-    if gcloud services list --enabled --filter="name:${api}" --format="value(name)" | grep -q "${api}"; then
-        echo "  ✓ ${api} enabled"
-    else
-        echo "  ✗ ${api} NOT enabled"
-    fi
+# Remove all deployer roles
+for ROLE in \
+  roles/compute.admin \
+  roles/dns.admin \
+  roles/storage.admin \
+  roles/iam.serviceAccountAdmin \
+  roles/iam.serviceAccountUser \
+  roles/iam.roleAdmin \
+  roles/iam.workloadIdentityPoolAdmin \
+  roles/resourcemanager.projectIamAdmin \
+  roles/serviceusage.serviceUsageAdmin \
+  roles/browser; do
+  gcloud projects remove-iam-policy-binding $PROJECT_ID \
+    --member="serviceAccount:${DEPLOYER_SA}" \
+    --role="$ROLE" 2>/dev/null
 done
 
-# Check service accounts exist
-echo "Checking service accounts..."
-if gcloud iam service-accounts describe "${TERRAFORM_SA}" >/dev/null 2>&1; then
-    echo "  ✓ Terraform SA exists: ${TERRAFORM_SA}"
-else
-    echo "  ✗ Terraform SA missing: ${TERRAFORM_SA}"
-fi
+# Delete the deployer key
+rm -f deployer-key.json
 
-if gcloud iam service-accounts describe "${NODE_SA}" >/dev/null 2>&1; then
-    echo "  ✓ Node SA exists: ${NODE_SA}"
-else
-    echo "  ✗ Node SA missing: ${NODE_SA}"
-fi
-
-echo "Permission validation complete."
+# Optionally delete the deployer SA entirely
+gcloud iam service-accounts delete "${DEPLOYER_SA}" --quiet
 ```
 
-## Custom IAM Roles (Advanced)
+The cluster continues to function because:
+- The **node SA** has its own permanent bindings (created by Terraform)
+- The **per-operator SAs** have their own WIF bindings (created by ccoctl)
+- Neither depends on the deployer SA
 
-### UPI Deployment Custom Role
+---
+
+## Permissions by Tool (Reference)
+
+### What Each Role Is Used For
+
+| Role | Used By | What It Does |
+|------|---------|-------------|
+| `roles/compute.admin` | Terraform, Ansible | VMs, VPC, subnets, firewalls, router, NAT, images |
+| `roles/dns.admin` | Terraform, Ansible | Private DNS zone, A records, post-bootstrap DNS flips |
+| `roles/storage.admin` | Terraform, ccoctl | Bootstrap ignition bucket, OIDC discovery bucket |
+| `roles/iam.serviceAccountAdmin` | Terraform, ccoctl | Node SA, per-operator WIF SAs |
+| `roles/iam.serviceAccountUser` | Terraform | Attach node SA to VM instances |
+| `roles/iam.roleAdmin` | Terraform, ccoctl | Custom IAM roles for operators |
+| `roles/iam.workloadIdentityPoolAdmin` | ccoctl | WIF pool and OIDC provider |
+| `roles/resourcemanager.projectIamAdmin` | Terraform, ccoctl | Bind IAM roles to SAs |
+| `roles/serviceusage.serviceUsageAdmin` | Terraform | Enable iam/iamcredentials/sts APIs |
+| `roles/browser` | openshift-install | Read project metadata |
+
+### What Is NOT Needed
+
+| Role | Why Not Needed |
+|------|---------------|
+| `roles/owner` | Too broad - the 10 roles above are sufficient |
+| `roles/iam.serviceAccountKeyAdmin` | No SA keys created (WIF replaces them) |
+| `roles/editor` | Too broad - includes unnecessary permissions |
+
+---
+
+## Node SA Permissions (Permanent)
+
+The node SA is created by Terraform and stays for the cluster lifetime. Its permissions are:
+
+```
+roles/compute.viewer         # CCM reads instance metadata
+roles/storage.admin          # Bootstrap ignition fetch, registry storage
+roles/logging.logWriter      # Ship logs to GCP
+roles/monitoring.metricWriter # Ship metrics to GCP
+<custom_operator_role>       # 103 granular permissions for CCM LB operations
+```
+
+These are managed by Terraform (`terraform/main.tf` lines 104-147, 662-667). The custom operator role contains permissions for CSI, CCM load balancers, DNS, image registry GCS, Filestore, and Machine API.
+
+---
+
+## Per-Operator WIF SAs (Created by ccoctl)
+
+ccoctl creates 7 GCP service accounts, each with a minimal custom IAM role:
+
+| GCP SA | Operator | Key Permissions |
+|--------|----------|-----------------|
+| `<name>-openshift-gcp-ccm` | Cloud Controller Manager | compute instances, LBs, health checks |
+| `<name>-openshift-machine-api-gcp` | Machine API | compute instances lifecycle |
+| `<name>-cloud-credential-operator-gcp-ro-creds` | Cloud Credential Operator | project.get (read-only) |
+| `<name>-openshift-image-registry-gcs` | Image Registry | storage buckets/objects |
+| `<name>-openshift-ingress-gcp` | Ingress Operator | DNS record management |
+| `<name>-openshift-cloud-network-config-controller-gcp` | Network Config Controller | compute networks/subnets read |
+| `<name>-openshift-gcp-pd-csi-driver-operator` | CSI Driver | compute disks, snapshots, instances |
+
+You don't manage these manually. ccoctl creates them with least-privilege IAM roles and WIF trust bindings. To clean them up:
+
 ```bash
-# Create custom role for UPI deployment (temporary use)
-gcloud iam roles create openshift.upi.deployer \
-    --project=$PROJECT_ID \
-    --title="OpenShift UPI Deployer" \
-    --description="Custom role for OpenShift UPI infrastructure deployment" \
-    --permissions="compute.instances.create,compute.instances.delete,compute.instances.get,compute.instances.list,compute.instances.setServiceAccount,compute.disks.create,compute.networks.create,compute.firewalls.create,dns.managedZones.create,dns.resourceRecordSets.create,storage.buckets.create,iam.serviceAccounts.actAs"
+ccoctl gcp delete \
+  --name=<cluster_name>-cluster \
+  --project=<project_id> \
+  --credentials-requests-dir=./credrequests
 ```
 
-### OpenShift Operations Custom Role  
+---
+
+## Custom Role Alternative (Most Restrictive)
+
+If predefined roles are too broad, create a single custom role with only the exact permissions needed. This is the absolute minimum:
+
 ```bash
-# Create custom role for ongoing OpenShift operations (permanent)
-gcloud iam roles create openshift.cluster.operator \
-    --project=$PROJECT_ID \
-    --title="OpenShift Cluster Operator" \
-    --description="Minimal permissions for ongoing OpenShift cluster operations" \
-    --permissions="compute.instances.get,compute.instances.list,compute.disks.get,compute.disks.list,storage.objects.get,storage.objects.list,monitoring.timeSeries.create,logging.logEntries.create"
+gcloud iam roles create ocp_upi_deployer \
+  --project=$PROJECT_ID \
+  --title="OpenShift UPI Deployer (WIF)" \
+  --description="Minimal permissions for OCP 4.19 UPI deployment with WIF" \
+  --permissions="\
+compute.addresses.create,\
+compute.addresses.delete,\
+compute.addresses.get,\
+compute.addresses.list,\
+compute.addresses.use,\
+compute.disks.create,\
+compute.disks.get,\
+compute.firewalls.create,\
+compute.firewalls.delete,\
+compute.firewalls.get,\
+compute.firewalls.list,\
+compute.firewalls.update,\
+compute.images.create,\
+compute.images.get,\
+compute.images.list,\
+compute.images.useReadOnly,\
+compute.instances.create,\
+compute.instances.delete,\
+compute.instances.get,\
+compute.instances.list,\
+compute.instances.setMetadata,\
+compute.instances.setServiceAccount,\
+compute.instances.setTags,\
+compute.machineTypes.get,\
+compute.machineTypes.list,\
+compute.networks.create,\
+compute.networks.delete,\
+compute.networks.get,\
+compute.networks.list,\
+compute.networks.updatePolicy,\
+compute.regionOperations.get,\
+compute.regions.get,\
+compute.regions.list,\
+compute.routers.create,\
+compute.routers.delete,\
+compute.routers.get,\
+compute.routers.update,\
+compute.subnetworks.create,\
+compute.subnetworks.delete,\
+compute.subnetworks.get,\
+compute.subnetworks.list,\
+compute.subnetworks.use,\
+compute.zones.get,\
+compute.zones.list,\
+dns.changes.create,\
+dns.changes.get,\
+dns.changes.list,\
+dns.managedZones.create,\
+dns.managedZones.delete,\
+dns.managedZones.get,\
+dns.managedZones.list,\
+dns.resourceRecordSets.create,\
+dns.resourceRecordSets.delete,\
+dns.resourceRecordSets.get,\
+dns.resourceRecordSets.list,\
+dns.resourceRecordSets.update,\
+iam.roles.create,\
+iam.roles.delete,\
+iam.roles.get,\
+iam.roles.list,\
+iam.roles.update,\
+iam.serviceAccounts.actAs,\
+iam.serviceAccounts.create,\
+iam.serviceAccounts.delete,\
+iam.serviceAccounts.get,\
+iam.serviceAccounts.getIamPolicy,\
+iam.serviceAccounts.list,\
+iam.serviceAccounts.setIamPolicy,\
+iam.workloadIdentityPoolProviders.create,\
+iam.workloadIdentityPoolProviders.delete,\
+iam.workloadIdentityPoolProviders.get,\
+iam.workloadIdentityPoolProviders.list,\
+iam.workloadIdentityPools.create,\
+iam.workloadIdentityPools.delete,\
+iam.workloadIdentityPools.get,\
+iam.workloadIdentityPools.list,\
+resourcemanager.projects.get,\
+resourcemanager.projects.getIamPolicy,\
+resourcemanager.projects.setIamPolicy,\
+serviceusage.services.enable,\
+serviceusage.services.get,\
+serviceusage.services.list,\
+storage.buckets.create,\
+storage.buckets.delete,\
+storage.buckets.get,\
+storage.buckets.getIamPolicy,\
+storage.buckets.list,\
+storage.buckets.setIamPolicy,\
+storage.objects.create,\
+storage.objects.delete,\
+storage.objects.get,\
+storage.objects.list"
+
+# Bind the custom role
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:${DEPLOYER_SA}" \
+  --role="projects/${PROJECT_ID}/roles/ocp_upi_deployer"
 ```
 
-## Conclusion
+---
 
-Proper GCP permissions are crucial for successful OpenShift UPI deployment. Start with the minimal required permissions and expand as needed. Always follow security best practices and regularly audit your IAM policies.
+## Gotcha: Cross-Project Service Accounts
 
-For production deployments, consider using:
-- [Workload Identity](https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity) for cluster workloads
-- [IAM Conditions](https://cloud.google.com/iam/docs/conditions-overview) for time-bound or resource-specific access
-- [VPC Service Controls](https://cloud.google.com/vpc-service-controls) for additional security boundaries
+If your deployer SA lives in a different GCP project (common in managed lab environments like RHPDS), `roles/owner` on the target project may NOT grant WIF pool permissions. You must explicitly add `roles/iam.workloadIdentityPoolAdmin`. See `docs/WIF_IMPLEMENTATION.md` gotcha #2 for details.
 
-## References
+---
 
-- [GCP IAM Roles Documentation](https://cloud.google.com/iam/docs/understanding-roles)
-- [OpenShift on GCP Documentation](https://docs.openshift.com/container-platform/4.19/installing/installing_gcp/installing-gcp-user-infra.html)
-- [Terraform Google Provider Documentation](https://registry.terraform.io/providers/hashicorp/google/latest/docs)
+## Verification
+
+After setup, verify the deployer SA has the right permissions:
+
+```bash
+# Activate the deployer SA
+gcloud auth activate-service-account --key-file=deployer-key.json
+
+# Test each permission area
+gcloud compute zones list --limit=1                        # compute
+gcloud dns managed-zones list --limit=1                    # dns
+gsutil ls 2>/dev/null; echo "storage: $?"                  # storage
+gcloud iam service-accounts list --limit=1                 # iam
+gcloud iam workload-identity-pools list --location=global  # wif
+gcloud services list --enabled --limit=1                   # serviceusage
+gcloud projects describe $PROJECT_ID --format="value(name)" # browser
+```
