@@ -382,46 +382,25 @@ oc get pvc wif-test-pvc
 
 ---
 
-## Security: The OIDC Bucket
+## Security: Locking Down the OIDC Bucket
 
-### What ccoctl creates by default
+### The problem
 
-The `ccoctl gcp create-all` command creates a GCS bucket (`<name>-oidc`) and sets it to **publicly readable** (`allUsers` with `roles/storage.objectViewer`). This means anyone on the internet can access the bucket contents.
+`ccoctl gcp create-all` creates a GCS bucket (`<name>-oidc`) containing the OIDC discovery document and public signing key, then sets it to **internet-readable** (`allUsers` with `roles/storage.objectViewer`). This is unnecessary — GCP supports embedding the JWKS directly in the WIF provider, which makes the bucket irrelevant for token validation.
 
-The bucket contains exactly 2 files:
+> **Note:** `ccoctl` does not have a `--private` flag for GCP yet. AWS has `--create-private-s3-bucket` but no GCP equivalent exists. The lockdown below is a manual post-deploy step.
 
-| File | Contents |
-|------|----------|
-| `.well-known/openid-configuration` | JSON discovery document pointing to the JWKS URL |
-| `keys.json` | The **public** signing key in JWKS format |
+### Lockdown procedure
 
-It does **NOT** contain the private signing key. The private key stays in `ccoctl-output/tls/bound-service-account-signing-key.key` and is baked into the cluster's ignition configs — it never leaves the control plane.
-
-### The public bucket is NOT required
-
-GCP supports uploading the JWKS directly to the WIF provider using the `--jwk-json-path` flag. When JWKS is uploaded directly, GCP's STS validates tokens using the locally-stored key material — it never needs to fetch from any external URL. This eliminates the need for a public bucket entirely.
-
-However, `ccoctl` does not support this today. It always creates a public bucket. The OpenShift CCO project has added `--create-private-s3-bucket` support for AWS but there is no equivalent `--private` flag for GCP yet.
-
-**Your options:**
-
-| Option | Public Exposure | Effort | Support Status |
-|--------|----------------|--------|---------------|
-| Use ccoctl as-is | Internet-readable bucket | None | Fully supported by Red Hat |
-| Post-deploy lockdown (see below) | No public access | Manual steps after ccoctl | Manual / unsupported |
-| Wait for ccoctl `--private` GCP flag | No public access | None | Not yet implemented |
-
-### Post-deploy lockdown procedure
-
-After `ccoctl gcp create-all` completes and before or after cluster deployment, you can remove public access and upload JWKS directly to the WIF provider:
+Run these steps after `ccoctl gcp create-all` completes (before or after cluster deployment):
 
 ```bash
 # Step 1: Upload JWKS directly to the WIF provider
-# This tells GCP STS to use the embedded key instead of fetching from the bucket
+# GCP STS will use this embedded key material instead of fetching from the bucket
 gcloud iam workload-identity-pools providers update-oidc <name> \
   --workload-identity-pool=<name> \
   --location=global \
-  --jwk-json-path=./ccoctl-output/manifests/../keys.json
+  --jwk-json-path=./ccoctl-output/keys.json
 
 # Step 2: Remove public access from the OIDC bucket
 gsutil iam ch -d allUsers:objectViewer gs://<name>-oidc
@@ -431,9 +410,15 @@ gsutil iam get gs://<name>-oidc | grep allUsers
 # Should return nothing
 ```
 
-After this, the bucket is private and GCP STS uses the JWKS embedded in the WIF provider. The `serviceAccountIssuer` URL in the cluster still points to the bucket, but STS no longer needs to reach it.
+After this:
+- The bucket is private — no internet access
+- GCP STS validates tokens using the JWKS embedded in the WIF provider
+- The `serviceAccountIssuer` URL in the cluster still references the bucket, but STS no longer fetches from it
 
-**Note:** When rotating signing keys, you must update the JWKS in the WIF provider (not just the bucket):
+### Key rotation
+
+When rotating signing keys, update the JWKS in the WIF provider:
+
 ```bash
 gcloud iam workload-identity-pools providers update-oidc <name> \
   --workload-identity-pool=<name> \
@@ -441,40 +426,26 @@ gcloud iam workload-identity-pools providers update-oidc <name> \
   --jwk-json-path=./new-keys.json
 ```
 
-### Risk analysis
-
-Even if you leave the bucket public (ccoctl default), the exposure is limited:
-
-**What an attacker gains from the public bucket:** The ability to verify that a token was signed by your cluster. They can confirm "yes, this JWT is valid" — but they cannot forge tokens because they don't have the private key. The public key is cryptographically designed to be shared. This is how all OIDC/JWT systems work.
-
-**What an attacker would need to actually exploit WIF:**
-1. The **private signing key** (stored only on control plane nodes in etcd), OR
-2. A **valid projected SA token** from a running operator pod (requires cluster access)
-3. AND knowledge of which GCP SA to impersonate (the audience/SA email in the credential config)
+GCP supports a maximum of 8 keys uploaded to a WIF provider at a time. During rotation, upload both old and new keys, wait for all tokens signed with the old key to expire (default 1 hour), then remove the old key.
 
 ### Threats and mitigations
 
 | Threat | Impact | Mitigation |
 |--------|--------|------------|
-| **OIDC bucket publicly readable** | Attacker can read the public signing key (by design, not a secret) | Use the post-deploy lockdown procedure above to remove public access and upload JWKS directly to the WIF provider. |
-| **OIDC bucket tampering** | Attacker replaces public key with their own, enabling forged tokens | Bucket is public-**read** only. Write access is restricted to the deployer SA. After deployment, remove the deployer SA entirely (see [GCP_PERMISSIONS.md](GCP_PERMISSIONS.md) Step 6). With JWKS uploaded directly to WIF provider, bucket tampering has no effect. |
-| **Private signing key compromise** | Attacker can forge tokens and impersonate any operator GCP SA | Key lives only in etcd on control plane nodes. Protect control plane access. |
+| **OIDC bucket tampering** | Attacker replaces public key with their own, enabling forged tokens | With JWKS embedded in the WIF provider, bucket tampering has no effect on token validation. Delete the deployer SA after deployment to remove write access (see [GCP_PERMISSIONS.md](GCP_PERMISSIONS.md) Step 6). |
+| **Private signing key compromise** | Attacker can forge tokens and impersonate any operator GCP SA | Key lives only in etcd on control plane nodes. Protect control plane access. Rotate immediately if compromised. |
 | **Overly broad WIF trust bindings** | A compromised pod could impersonate an operator SA | ccoctl scopes each binding to a specific `system:serviceaccount:<namespace>:<sa-name>` subject — only the exact operator SA in the exact namespace can impersonate the corresponding GCP SA. |
 | **Token exfiltration from a pod** | Attacker steals a projected SA token and exchanges it for a GCP token | Projected tokens are short-lived (default 1 hour) and audience-scoped to a specific WIF pool. Limit pod access with RBAC and network policies. |
 
-### Hardening recommendations
+### Additional hardening
 
-1. **Lock down the OIDC bucket** — use the post-deploy lockdown procedure to remove public access and upload JWKS directly to the WIF provider
-2. **Delete the deployer SA after deployment** — removes the only identity with write access to the OIDC bucket
-3. **Enable GCS bucket audit logging** — detect unexpected reads/writes to the OIDC bucket
-4. **Monitor WIF token exchanges** — GCP audit logs record every `sts.googleapis.com` token exchange, including the source K8s SA identity
-5. **Rotate the signing key** — if you suspect the private key is compromised, generate a new key pair, update the JWKS in the WIF provider, and restart the kube-apiserver (this invalidates all existing tokens)
+1. **Delete the deployer SA after deployment** — removes the only identity with write access to the OIDC bucket
+2. **Enable GCS bucket audit logging** — detect unexpected access to the OIDC bucket
+3. **Monitor WIF token exchanges** — GCP audit logs record every `sts.googleapis.com` token exchange, including the source K8s SA identity
 
 Sources:
 - [GCP: Configure WIF with other identity providers](https://docs.cloud.google.com/iam/docs/workload-identity-federation-with-other-providers) — documents `--jwk-json-path` for direct JWKS upload
-- [GCP: Configure WIF with Kubernetes](https://cloud.google.com/iam/docs/workload-identity-federation-with-kubernetes) — Kubernetes-specific WIF setup
 - [gcloud create-oidc reference](https://cloud.google.com/sdk/gcloud/reference/iam/workload-identity-pools/providers/create-oidc) — `--jwk-json-path` flag documentation
-- [OpenShift CCO: GCP Workload Identity](https://github.com/openshift/cloud-credential-operator/blob/master/docs/gcp_workload_identity.md) — ccoctl GCP documentation
 - [OpenShift CCO: Private S3 bucket PR (AWS)](https://github.com/openshift/cloud-credential-operator/pull/486) — shows the pattern exists for AWS, not yet for GCP
 
 ---
