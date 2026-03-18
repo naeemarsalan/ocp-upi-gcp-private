@@ -3,11 +3,11 @@
 # Copy this file and customize for your environment
 
 # GCP Configuration
-gcp_project_id: "openenv-6d8kc"
+gcp_project_id: "openenv-pxs7m"
 
 # OpenShift Configuration
 cluster_name: "ocp"
-domain_name: "ocp.6d8kc.gcp.redhatworkshops.io"
+domain_name: "ocp.pxs7m.gcp.redhatworkshops.io"
 
 # Infrastructure Configuration
 bastion_zone: "us-central1-a"

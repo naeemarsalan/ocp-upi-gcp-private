@@ -240,7 +240,7 @@ ccoctl gcp create-service-accounts \
   --output-dir=./ccoctl-output
 ```
 
-> The `--issuer-uri` is used as an identifier in the credential configs. Since JWKS is embedded in the provider, GCP STS never fetches from this URL. Keep the format consistent because `create-service-accounts` generates the authentication manifest using this convention.
+> The `--issuer-uri` is used as an identifier in the credential configs and in the `serviceAccountIssuer` in step 3e. Since JWKS is embedded in the provider, GCP STS never fetches from this URL — it serves as a unique identifier only.
 
 **Alternatively**, if you prefer the simpler `create-all` command, see [Fallback: Lockdown after create-all](#fallback-lockdown-after-create-all) in the Security section.
 
@@ -476,6 +476,36 @@ This removes:
 - All per-operator GCP service accounts
 - The OIDC GCS bucket (if it was created by `create-all`)
 
+### CCM-created resources block terraform destroy
+
+The Cloud Controller Manager creates firewall rules, forwarding rules, target pools, and health checks for LoadBalancer services (e.g., the ingress router). These are not managed by Terraform and will block VPC deletion with errors like:
+
+```
+Error: The network resource is already being used by 'projects/.../firewalls/k8s-fw-...'
+```
+
+Clean them up before or after `terraform destroy`:
+
+```bash
+# Delete CCM-created firewall rules
+for fw in $(gcloud compute firewall-rules list --filter="network:<cluster>-vpc AND name~k8s" --format="value(name)"); do
+  gcloud compute firewall-rules delete $fw --quiet
+done
+
+# Delete forwarding rules, target pools, health checks
+for fr in $(gcloud compute forwarding-rules list --filter="name~k8s" --format="value(name)"); do
+  gcloud compute forwarding-rules delete $fr --region=<region> --quiet
+done
+for tp in $(gcloud compute target-pools list --format="value(name)"); do
+  gcloud compute target-pools delete $tp --region=<region> --quiet
+done
+for hc in $(gcloud compute http-health-checks list --format="value(name)"); do
+  gcloud compute http-health-checks delete $hc --quiet
+done
+```
+
+Then retry `terraform destroy`.
+
 ---
 
 ## Gotchas
@@ -490,7 +520,18 @@ INVALID_ARGUMENT: Invalid WorkloadIdentityPool ID
 
 **Fix:** Append a suffix: `--name=ocp-cluster`
 
-### 2. Cross-project SAs may need explicit WIF roles
+### 2. ccoctl uses ADC, not gcloud auth
+
+`ccoctl` authenticates using [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials) (ADC), not the active `gcloud auth` account. Even if `gcloud` CLI commands work fine, `ccoctl` may fail with 403 if ADC isn't configured.
+
+This is especially common with cross-project service accounts where `gcloud auth activate-service-account` sets the gcloud CLI identity but doesn't update ADC.
+
+**Fix:** Set the ADC file to your SA key. `GOOGLE_APPLICATION_CREDENTIALS` env var should work per the ADC spec, but `ccoctl` has been observed to ignore it in favor of the ADC file. The reliable fix:
+```bash
+cp <sa-key.json> ~/.config/gcloud/application_default_credentials.json
+```
+
+### 3. Cross-project SAs may need explicit WIF roles
 
 If the SA running `ccoctl` belongs to a different project (common in managed lab environments), `roles/owner` on the target project may not be sufficient. You'll see:
 
@@ -505,7 +546,7 @@ gcloud projects add-iam-policy-binding <target_project> \
   --role="roles/iam.workloadIdentityPoolAdmin"
 ```
 
-### 3. GCP APIs must be enabled before ccoctl
+### 4. GCP APIs must be enabled before ccoctl
 
 The STS API (`sts.googleapis.com`) may not be enabled by default. Enable manually if Terraform hasn't run yet:
 
@@ -513,7 +554,7 @@ The STS API (`sts.googleapis.com`) may not be enabled by default. Enable manuall
 gcloud services enable sts.googleapis.com iamcredentials.googleapis.com iam.googleapis.com
 ```
 
-### 4. Manifest generation must be split from ignition
+### 5. Manifest generation must be split from ignition
 
 The old single-step `openshift-install create ignition-configs` must be split into:
 1. `openshift-install create manifests`
@@ -522,15 +563,15 @@ The old single-step `openshift-install create ignition-configs` must be split in
 
 Running `create ignition-configs` directly generates and immediately consumes manifests — no window to inject ccoctl output.
 
-### 5. install-config.yaml stays the same
+### 6. install-config.yaml stays the same
 
 `credentialsMode: Manual` works for both SA key injection and WIF. No changes needed.
 
-### 6. ccoctl skips tech-preview CredentialsRequests
+### 7. ccoctl skips tech-preview CredentialsRequests
 
 The Cluster API CredentialsRequest has a tech-preview annotation and is skipped unless `--enable-tech-preview` is passed. This is expected.
 
-### 7. Node SA is still required
+### 8. Node SA is still required
 
 Even with WIF, VMs need a GCP service account attached for:
 - Cloud Controller Manager metadata auth
@@ -539,7 +580,7 @@ Even with WIF, VMs need a GCP service account attached for:
 
 The node SA and its IAM bindings remain in Terraform.
 
-### 8. GCP soft-deletes WIF pools for 30 days
+### 9. GCP soft-deletes WIF pools for 30 days
 
 If you destroy a cluster and redeploy with the same `--name`, `ccoctl gcp create-workload-identity-pool` will undelete the old pool instead of creating a new one. However, `gcloud iam workload-identity-pools providers create-oidc` will fail with `ALREADY_EXISTS` because the soft-deleted provider is restored with the pool.
 
@@ -555,7 +596,7 @@ gcloud iam workload-identity-pools providers update-oidc <name> \
 
 Or use a different `--name` for each deployment.
 
-### 9. Expected UPI degraded operators
+### 10. Expected UPI degraded operators
 
 These operators show Degraded regardless of WIF (UPI limitations, not credential issues):
 - `control-plane-machine-set` — no Machine objects in UPI

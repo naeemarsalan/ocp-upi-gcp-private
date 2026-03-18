@@ -51,7 +51,7 @@ variable "service_cidr" {
 variable "domain_name" {
   description = "Base domain name for the cluster"
   type        = string
-  default     = "ocp.6d8kc.gcp.redhatworkshops.io"
+  default     = "ocp.pxs7m.gcp.redhatworkshops.io"
 }
 
 # VIP Configuration removed - using direct DNS to worker nodes
