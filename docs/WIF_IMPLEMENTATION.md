@@ -242,7 +242,7 @@ This single command creates all of the following in GCP:
 ```
 ccoctl-output/
   manifests/
-    cluster-authentication-02-config.yaml          # Sets serviceAccountIssuer to GCS bucket URL
+    cluster-authentication-02-config.yaml          # Sets serviceAccountIssuer URL
     openshift-cloud-controller-manager-gcp-ccm-cloud-credentials-credentials.yaml
     openshift-cloud-credential-operator-cloud-credential-operator-gcp-ro-creds-credentials.yaml
     openshift-cloud-network-config-controller-cloud-credentials-credentials.yaml
@@ -251,10 +251,18 @@ ccoctl-output/
     openshift-ingress-operator-cloud-credentials-credentials.yaml
     openshift-machine-api-gcp-cloud-credentials-credentials.yaml
   tls/
-    bound-service-account-signing-key.key          # RSA private key for signing SA tokens
-  serviceaccount-signer.private                    # Same signing key (copy)
-  serviceaccount-signer.public                     # Public key (embed into WIF provider via lockdown procedure)
+    bound-service-account-signing-key.key          # PRIVATE key — copied into clusterconfig/tls/,
+                                                   # baked into ignition, lives on control plane only.
+                                                   # NEVER uploaded to any bucket.
+  serviceaccount-signer.private                    # PRIVATE key — same key, stays local
+  serviceaccount-signer.public                     # PUBLIC key (PEM) — ccoctl converts this to JWKS
+                                                   # and uploads as keys.json to the OIDC bucket.
+                                                   # Embed into WIF provider via lockdown procedure.
 ```
+
+**What goes where:**
+- **Private key** (`*.private`, `*.key`) → control plane nodes only (via ignition). Never uploaded.
+- **Public key** (`*.public`) → converted to JWKS format (`keys.json`) and uploaded to GCS bucket by ccoctl. After lockdown, embedded directly in the WIF provider.
 
 The `cluster-authentication-02-config.yaml` sets the cluster's OIDC issuer:
 ```yaml
@@ -294,8 +302,7 @@ This confirms the WIF TLS key was picked up. The credential secrets and authenti
 
 1. `openshift-install create manifests` (generates manifests only)
 2. Extract CredentialsRequests from release image
-3. Run `ccoctl gcp create-all` (creates WIF resources + credential configs)
-4. **Lock down the OIDC bucket** (upload JWKS to WIF provider, remove public access)
+3. Run ccoctl sub-commands + `gcloud` to create WIF resources without a public bucket (see [Security](#recommended-no-bucket-flow-using-ccoctl-sub-commands)), or use `ccoctl gcp create-all` and lock down after
 5. Copy ccoctl output into manifests/tls directories
 6. `openshift-install create ignition-configs` (secrets baked into ignition)
 7. `terraform apply` (creates VMs, network, DNS - no operator SA or key)
@@ -385,22 +392,84 @@ oc get pvc wif-test-pvc
 
 ## Security: Locking Down the OIDC Bucket
 
+### Two buckets — don't confuse them
+
+This deployment creates two separate GCS buckets for different purposes:
+
+| Bucket | Created by | Contents | Risk |
+|--------|-----------|----------|------|
+| `<cluster>-bootstrap-ignition-<random>` | Terraform | `bootstrap.ign` — contains private signing key, kubeconfig credentials, cluster secrets | **High** — full cluster secrets. Only needed during bootstrap, should be cleaned up after. |
+| `<cluster>-oidc` | ccoctl | `keys.json` (public signing key), `.well-known/openid-configuration` | **Low** — public key only, no secrets. Lock down post-deploy. |
+
+Both are set to `allUsers` public read by default. The bootstrap bucket is public because the bootstrap node fetches ignition via plain HTTPS before it has any GCP credentials. The OIDC bucket is public because `ccoctl` doesn't have a private bucket option for GCP yet.
+
+The lockdown below covers the OIDC bucket. The bootstrap bucket should be cleaned up separately after the bootstrap node is no longer needed (Terraform handles this on `terraform destroy` with `force_destroy = true`).
+
 ### The problem
 
-`ccoctl gcp create-all` creates a GCS bucket (`<name>-oidc`) containing the OIDC discovery document and public signing key, then sets it to **internet-readable** (`allUsers` with `roles/storage.objectViewer`). This is unnecessary — GCP supports embedding the JWKS directly in the WIF provider, which makes the bucket irrelevant for token validation.
+`ccoctl gcp create-all` always creates a **public** OIDC bucket — there is no `--private` flag for GCP (AWS has `--create-private-s3-bucket`, GCP does not). You cannot pre-provision a private bucket and tell `ccoctl` to use it; it always creates its own with `allUsers` read access.
 
-> **Note:** `ccoctl` does not have a `--private` flag for GCP yet. AWS has `--create-private-s3-bucket` but no GCP equivalent exists. The lockdown below is a manual post-deploy step.
+This is unnecessary because GCP supports embedding the JWKS directly in the WIF provider via `--jwk-json-path`. When JWKS is embedded, GCP STS validates tokens using the key material stored in the provider itself — no bucket fetch needed.
 
-### Lockdown procedure
+### Recommended: No-bucket flow using ccoctl sub-commands
 
-Run these steps after `ccoctl gcp create-all` completes (before or after cluster deployment):
+Instead of `ccoctl gcp create-all` (which always creates a public bucket), use the individual sub-commands and create the WIF provider with `gcloud` directly. This **never creates a public bucket**.
+
+```bash
+# Step 1: Generate the signing key pair
+ccoctl gcp create-key-pair --output-dir=./ccoctl-output
+
+# Step 2: Convert the public key from PEM to JWKS format
+# (ccoctl outputs PEM, but gcloud --jwk-json-path requires JWKS)
+python3 -c "
+import json, base64
+from cryptography.hazmat.primitives.serialization import load_pem_public_key
+with open('./ccoctl-output/serviceaccount-signer.public', 'rb') as f:
+    key = load_pem_public_key(f.read())
+n = key.public_numbers()
+def b64(i): return base64.urlsafe_b64encode(i.to_bytes((i.bit_length()+7)//8,'big')).rstrip(b'=').decode()
+print(json.dumps({'keys':[{'use':'sig','kty':'RSA','alg':'RS256','n':b64(n.n),'e':b64(n.e)}]},indent=2))
+" > ./ccoctl-output/keys.json
+
+# Step 3: Create the WIF pool
+ccoctl gcp create-workload-identity-pool \
+  --name=<name> \
+  --project=<project_id> \
+  --output-dir=./ccoctl-output
+
+# Step 4: Create the WIF provider with gcloud (NOT ccoctl) — no bucket created
+# The JWKS is embedded directly in the provider
+gcloud iam workload-identity-pools providers create-oidc <name> \
+  --workload-identity-pool=<name> \
+  --location=global \
+  --issuer-uri=https://storage.googleapis.com/<name>-oidc \
+  --allowed-audiences=openshift \
+  --attribute-mapping="google.subject=assertion.sub" \
+  --jwk-json-path=./ccoctl-output/keys.json
+
+# Step 5: Create per-operator service accounts and credential configs
+ccoctl gcp create-service-accounts \
+  --name=<name> \
+  --project=<project_id> \
+  --credentials-requests-dir=./credrequests \
+  --workload-identity-pool=<name> \
+  --workload-identity-provider=<name> \
+  --output-dir=./ccoctl-output
+```
+
+This produces the same output as `create-all` (manifests, TLS keys, credential configs) but **no GCS bucket is created**. The `issuer-uri` still references a bucket URL in the provider config, but since the JWKS is embedded directly, GCP STS never fetches from that URL.
+
+> **Note:** The `--issuer-uri` value must match what goes into `cluster-authentication-02-config.yaml` as `serviceAccountIssuer`. If using the no-bucket flow, you can set it to any unique URL — it's used as an identifier, not fetched. However, ccoctl's `create-service-accounts` generates the authentication manifest using this convention, so keep the format consistent.
+
+### Fallback: Lockdown after create-all
+
+If you prefer to use `ccoctl gcp create-all` for simplicity, lock down the bucket immediately after:
 
 ```bash
 # Step 1: Download the JWKS from the bucket (ccoctl doesn't save it locally)
 gsutil cp gs://<name>-oidc/keys.json ./ccoctl-output/keys.json
 
 # Step 2: Upload JWKS directly to the WIF provider
-# GCP STS will use this embedded key material instead of fetching from the bucket
 gcloud iam workload-identity-pools providers update-oidc <name> \
   --workload-identity-pool=<name> \
   --location=global \
@@ -414,10 +483,7 @@ gsutil iam get gs://<name>-oidc | grep allUsers
 # Should return nothing
 ```
 
-After this:
-- The bucket is private — no internet access
-- GCP STS validates tokens using the JWKS embedded in the WIF provider
-- The `serviceAccountIssuer` URL in the cluster still references the bucket, but STS no longer fetches from it
+With this fallback, there is a brief window between `create-all` and lockdown where the bucket is public. Only the public signing key is exposed during this window — the private key is never in the bucket.
 
 ### Key rotation
 
