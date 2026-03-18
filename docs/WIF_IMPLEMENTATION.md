@@ -6,12 +6,12 @@ This document covers the complete implementation of GCP Workload Identity Federa
 
 Instead of injecting a static GCP service account key into each operator namespace, WIF uses a token exchange flow:
 
-1. The cluster's OIDC signing keys are uploaded to a **public GCS bucket**
-2. A GCP **Workload Identity Pool** and **OIDC Provider** are configured to trust tokens signed by the cluster
+1. A GCP **Workload Identity Pool** and **OIDC Provider** are configured to trust tokens signed by the cluster
+2. The cluster's OIDC public signing key is embedded in the WIF provider (see [Security: Locking Down the OIDC Bucket](#security-locking-down-the-oidc-bucket))
 3. Each operator pod gets a **projected Kubernetes service account token** mounted at `/var/run/secrets/openshift/serviceaccount/token`
 4. When the operator needs GCP access, the Go client library reads the `external_account` credential config and:
    - Sends the K8s SA token to **GCP Security Token Service** (`sts.googleapis.com`)
-   - STS validates the token against the OIDC discovery docs in the GCS bucket
+   - STS validates the token signature against the JWKS in the WIF provider
    - STS returns a federated access token
    - The client exchanges this for a **short-lived GCP access token** via `iamcredentials.googleapis.com` (service account impersonation)
 5. No long-lived keys exist anywhere in the cluster
@@ -231,9 +231,9 @@ ccoctl gcp create-all \
 This single command creates all of the following in GCP:
 
 **GCP Resources Created:**
-- GCS bucket `<name>-oidc` (public, contains OIDC discovery docs and JWKS)
+- GCS bucket `<name>-oidc` (contains OIDC discovery docs and JWKS — lock this down post-deploy, see [Security](#security-locking-down-the-oidc-bucket))
 - Workload Identity Pool `<name>`
-- Workload Identity OIDC Provider `<name>` (trusts tokens from the OIDC bucket issuer)
+- Workload Identity OIDC Provider `<name>` (validates tokens using embedded JWKS after lockdown)
 - 7 per-operator GCP service accounts (e.g., `<name>-openshift-gcp-ccm`, `<name>-openshift-gcp-pd-csi-driver-operator`)
 - 7 per-operator IAM custom roles with minimal permissions
 - WIF trust bindings: each K8s service account is authorized to impersonate its corresponding GCP SA
@@ -253,7 +253,7 @@ ccoctl-output/
   tls/
     bound-service-account-signing-key.key          # RSA private key for signing SA tokens
   serviceaccount-signer.private                    # Same signing key (copy)
-  serviceaccount-signer.public                     # Public key (uploaded to OIDC bucket)
+  serviceaccount-signer.public                     # Public key (embed into WIF provider via lockdown procedure)
 ```
 
 The `cluster-authentication-02-config.yaml` sets the cluster's OIDC issuer:
@@ -295,13 +295,14 @@ This confirms the WIF TLS key was picked up. The credential secrets and authenti
 1. `openshift-install create manifests` (generates manifests only)
 2. Extract CredentialsRequests from release image
 3. Run `ccoctl gcp create-all` (creates WIF resources + credential configs)
-4. Copy ccoctl output into manifests/tls directories
-5. `openshift-install create ignition-configs` (secrets baked into ignition)
-6. `terraform apply` (creates VMs, network, DNS - no operator SA or key)
-7. Bootstrap, DNS transitions, CSR approval (unchanged)
-8. ~~Copy SA key to bastion~~ - **REMOVED**
-9. ~~Inject operator secrets~~ - **REMOVED** (already in ignition)
-10. Remove uninitialized taints, Filestore CSI setup, etc. (unchanged)
+4. **Lock down the OIDC bucket** (upload JWKS to WIF provider, remove public access)
+5. Copy ccoctl output into manifests/tls directories
+6. `openshift-install create ignition-configs` (secrets baked into ignition)
+7. `terraform apply` (creates VMs, network, DNS - no operator SA or key)
+8. Bootstrap, DNS transitions, CSR approval (unchanged)
+9. ~~Copy SA key to bastion~~ - **REMOVED**
+10. ~~Inject operator secrets~~ - **REMOVED** (already in ignition)
+11. Remove uninitialized taints, Filestore CSI setup, etc. (unchanged)
 
 ---
 
@@ -395,17 +396,20 @@ oc get pvc wif-test-pvc
 Run these steps after `ccoctl gcp create-all` completes (before or after cluster deployment):
 
 ```bash
-# Step 1: Upload JWKS directly to the WIF provider
+# Step 1: Download the JWKS from the bucket (ccoctl doesn't save it locally)
+gsutil cp gs://<name>-oidc/keys.json ./ccoctl-output/keys.json
+
+# Step 2: Upload JWKS directly to the WIF provider
 # GCP STS will use this embedded key material instead of fetching from the bucket
 gcloud iam workload-identity-pools providers update-oidc <name> \
   --workload-identity-pool=<name> \
   --location=global \
   --jwk-json-path=./ccoctl-output/keys.json
 
-# Step 2: Remove public access from the OIDC bucket
+# Step 3: Remove public access from the OIDC bucket
 gsutil iam ch -d allUsers:objectViewer gs://<name>-oidc
 
-# Step 3: Verify public access is removed
+# Step 4: Verify public access is removed
 gsutil iam get gs://<name>-oidc | grep allUsers
 # Should return nothing
 ```
