@@ -72,11 +72,10 @@ Enable before running `ccoctl`:
 gcloud services enable \
   iam.googleapis.com \
   iamcredentials.googleapis.com \
-  sts.googleapis.com \
-  storage.googleapis.com
+  sts.googleapis.com
 ```
 
-Terraform also enables `iam`, `iamcredentials`, and `sts` via `google_project_service` resources, but they must be enabled before `ccoctl` runs if you run `ccoctl` before Terraform.
+`storage.googleapis.com` is also needed for Terraform (bootstrap ignition bucket) but not for the no-bucket ccoctl flow. Terraform also enables `iam`, `iamcredentials`, and `sts` via `google_project_service` resources, but they must be enabled before `ccoctl` runs if you run `ccoctl` before Terraform.
 
 ### Tools
 
@@ -220,7 +219,18 @@ gcloud iam workload-identity-pools providers create-oidc $NAME \
   --attribute-mapping="google.subject=assertion.sub" \
   --jwk-json-path=./ccoctl-output/keys.json
 
-# 3e: Create per-operator service accounts and credential configs
+# 3e: Create the cluster authentication manifest
+#     (normally created by create-workload-identity-provider, which we skipped)
+cat > ./ccoctl-output/manifests/cluster-authentication-02-config.yaml <<EOF
+apiVersion: config.openshift.io/v1
+kind: Authentication
+metadata:
+  name: cluster
+spec:
+  serviceAccountIssuer: https://storage.googleapis.com/${NAME}-oidc
+EOF
+
+# 3f: Create per-operator service accounts and credential configs
 ccoctl gcp create-service-accounts \
   --name=$NAME \
   --project=$PROJECT \
@@ -246,7 +256,7 @@ ccoctl gcp create-service-accounts \
 ```
 ccoctl-output/
   manifests/
-    cluster-authentication-02-config.yaml         # Sets serviceAccountIssuer URL
+    cluster-authentication-02-config.yaml         # Sets serviceAccountIssuer URL (created by step 3e)
     openshift-cloud-controller-manager-gcp-ccm-cloud-credentials-credentials.yaml
     openshift-cloud-credential-operator-cloud-credential-operator-gcp-ro-creds-credentials.yaml
     openshift-cloud-network-config-controller-cloud-credentials-credentials.yaml
@@ -529,7 +539,23 @@ Even with WIF, VMs need a GCP service account attached for:
 
 The node SA and its IAM bindings remain in Terraform.
 
-### 8. Expected UPI degraded operators
+### 8. GCP soft-deletes WIF pools for 30 days
+
+If you destroy a cluster and redeploy with the same `--name`, `ccoctl gcp create-workload-identity-pool` will undelete the old pool instead of creating a new one. However, `gcloud iam workload-identity-pools providers create-oidc` will fail with `ALREADY_EXISTS` because the soft-deleted provider is restored with the pool.
+
+**Fix:** Undelete the provider and update it instead of creating:
+```bash
+gcloud iam workload-identity-pools providers undelete <name> \
+  --workload-identity-pool=<name> --location=global
+
+gcloud iam workload-identity-pools providers update-oidc <name> \
+  --workload-identity-pool=<name> --location=global \
+  --jwk-json-path=./ccoctl-output/keys.json
+```
+
+Or use a different `--name` for each deployment.
+
+### 9. Expected UPI degraded operators
 
 These operators show Degraded regardless of WIF (UPI limitations, not credential issues):
 - `control-plane-machine-set` — no Machine objects in UPI
