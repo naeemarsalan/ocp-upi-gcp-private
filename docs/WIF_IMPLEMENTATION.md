@@ -48,7 +48,7 @@ Key differences from old approach:
 
 ### GCP Permissions
 
-The deployer SA needs 10 specific IAM roles (not `roles/owner`). See [GCP_PERMISSIONS.md](GCP_PERMISSIONS.md) for the complete step-by-step setup including the minimal custom role alternative.
+The deployer SA needs 10 specific IAM roles (not `roles/owner`). See [GCP_PERMISSIONS.md](GCP_PERMISSIONS.md) for the complete step-by-step setup, or for the most locked-down option see the [Custom Role Alternative (Most Restrictive)](https://github.com/naeemarsalan/ocp-upi-gcp-private/blob/master/docs/GCP_PERMISSIONS.md#custom-role-alternative-most-restrictive).
 
 ### Required GCP APIs
 
